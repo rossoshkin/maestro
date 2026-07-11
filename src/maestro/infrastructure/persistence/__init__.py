@@ -28,6 +28,9 @@ from maestro.infrastructure.persistence.sqlite_work_item_repository import (
 from maestro.infrastructure.persistence.sqlite_workflow_repository import (
     SQLiteWorkflowRepository,
 )
+from maestro.infrastructure.persistence.sqlite_workspace_repository import (
+    SQLiteWorkspaceRepository,
+)
 
 __all__ = [
     "SQLiteAgentRepository",
@@ -39,5 +42,6 @@ __all__ = [
     "SQLiteProviderRepository",
     "SQLiteRoleRepository",
     "SQLiteWorkItemRepository",
+    "SQLiteWorkspaceRepository",
     "SQLiteWorkflowRepository",
 ]

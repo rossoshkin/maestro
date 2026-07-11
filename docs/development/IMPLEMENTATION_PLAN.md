@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 11 — Workspace Abstraction
+Current milestone: Milestone 12 — Artifact and Event Resources
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -846,6 +846,8 @@ Maestro has a stable model-agnostic Provider contract.
 
 # Milestone 11 — Workspace Abstraction
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement Workspace resource, provider interface, and lifecycle.
@@ -909,6 +911,20 @@ Implement Workspace resource, provider interface, and lifecycle.
 ## Exit Criteria
 
 A safe local Workspace can be created, used, inspected, and cleaned.
+
+## Completion Notes
+
+- Added `Workspace`, `WorkspaceSpec`, `WorkspaceStatus`, lifecycle phases, cleanup finalizer enforcement, Execution ownership validation and Workspace repository protocol.
+- Added Workspace path safety helpers that reject path traversal and symlink escapes.
+- Added Workspace locking helpers with optimistic concurrency.
+- Added SQLite Workspace persistence with list-by-Execution support and restart-safe serialized snapshots.
+- Added `WorkspaceLifecycleService` for prepare, state refresh, diff collection, command execution and cleanup flows.
+- Added a local Git worktree provider that creates branch-per-Execution worktrees, preserves source checkouts, collects Git status/diff and refuses unsafe cleanup targets.
+- Added domain, persistence, lifecycle and real Git provider tests covering traversal, symlink escape, source protection, cleanup diagnostics, locking and restart behavior.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run mypy src`
 
 ---
 

@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 4 — Workflow Resource
+Current milestone: Milestone 5 — Plan Resource
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -273,6 +273,8 @@ Execution lifecycle and persistence are complete and fully validated.
 
 # Milestone 4 — Workflow Resource
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement immutable, versioned Workflow definitions.
@@ -341,6 +343,20 @@ A Workflow describes desired orchestration state. It does not execute code.
 ## Exit Criteria
 
 Workflow definitions can be registered, validated, versioned, and referenced by Executions.
+
+## Completion Notes
+
+- Added `Workflow`, `WorkflowSpec`, `WorkflowStatus`, step models and supported step-type enums.
+- Added graph validation for duplicate step IDs, entrypoints, transition targets, terminal reachability, unreachable steps and unbounded cycles.
+- Added finite retry policy modeling and bounded-cycle validation for repair loops.
+- Added structural Role references that require Role name and version while prohibiting Agent, Provider or tool-specific fields.
+- Added immutable Workflow version behavior: existing Workflow specs cannot be changed; new versions are registered as distinct resources.
+- Added Workflow repository protocol and SQLite persistence implementation with exact `namespace/name/version` lookup.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run mypy src`
+  - `uv run pre-commit run --all-files`
 
 ---
 

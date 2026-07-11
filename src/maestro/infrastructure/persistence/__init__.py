@@ -3,6 +3,10 @@
 from maestro.infrastructure.persistence.sqlite_agent_repository import (
     SQLiteAgentRepository,
 )
+from maestro.infrastructure.persistence.sqlite_capability_repository import (
+    SQLiteCapabilityBindingRepository,
+    SQLiteCapabilityRepository,
+)
 from maestro.infrastructure.persistence.sqlite_execution_repository import (
     SQLiteExecutionRepository,
 )
@@ -24,6 +28,8 @@ from maestro.infrastructure.persistence.sqlite_workflow_repository import (
 
 __all__ = [
     "SQLiteAgentRepository",
+    "SQLiteCapabilityBindingRepository",
+    "SQLiteCapabilityRepository",
     "SQLiteExecutionRepository",
     "SQLitePlanRepository",
     "SQLiteProjectRepository",

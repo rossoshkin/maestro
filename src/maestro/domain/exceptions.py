@@ -81,3 +81,15 @@ class ResourceTransitionError(MaestroDomainError):
             f"Invalid phase transition for {resource_id}: "
             f"{current_phase} -> {next_phase}"
         )
+
+
+class CapabilityPolicyDeniedError(MaestroDomainError):
+    """Raised when Capability admission denies scheduling."""
+
+    def __init__(self, reason: str, message: str = "") -> None:
+        self.reason = reason
+        self.message = message
+        detail = f"Capability policy denied: {reason}"
+        if message:
+            detail = f"{detail}: {message}"
+        super().__init__(detail)

@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 9 — Capability System
+Current milestone: Milestone 10 — Provider Abstraction
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -685,6 +685,8 @@ Agents can be registered, validated, and matched against Role requirements.
 
 # Milestone 9 — Capability System
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement Maestro's capability-based authorization model.
@@ -745,6 +747,21 @@ Capabilities define permissions. Tools implement Capabilities.
 ## Exit Criteria
 
 Capability admission is deterministic, tested, and usable by scheduler and runtime.
+
+## Completion Notes
+
+- Expanded shared Capability primitives into first-class `Capability` and `CapabilityBinding` resources.
+- Added side-effect levels, approval policies, scopes, Capability phases and CapabilityBinding phases.
+- Added validation for canonical Capability names, schema references, duplicate grants/denies, duplicate scopes and sensitive destructive/privileged Capability policy requirements.
+- Added scoped CapabilityBinding matching with workspace label selectors.
+- Added deterministic Capability resolution with deny-by-default semantics, explicit grant handling, explicit deny precedence, ready Capability catalog checks and Agent-supported Capability filtering.
+- Added policy-denial modeling through structured violations and `CapabilityPolicyDeniedError`.
+- Enforced scheduler-admission rules: required Capabilities must be granted and Ready, Agents cannot self-grant through Agent-owned bindings, Planner cannot receive filesystem-write or shell-execute Capabilities, and Reviewer cannot receive filesystem-write Capabilities.
+- Added Capability and CapabilityBinding repository protocols plus SQLite persistence implementations with canonical-name lookup and Ready binding listing.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run mypy src`
 
 ---
 

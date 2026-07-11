@@ -9,6 +9,9 @@ from maestro.infrastructure.persistence.sqlite_plan_repository import (
 from maestro.infrastructure.persistence.sqlite_project_repository import (
     SQLiteProjectRepository,
 )
+from maestro.infrastructure.persistence.sqlite_work_item_repository import (
+    SQLiteWorkItemRepository,
+)
 from maestro.infrastructure.persistence.sqlite_workflow_repository import (
     SQLiteWorkflowRepository,
 )
@@ -17,5 +20,6 @@ __all__ = [
     "SQLiteExecutionRepository",
     "SQLitePlanRepository",
     "SQLiteProjectRepository",
+    "SQLiteWorkItemRepository",
     "SQLiteWorkflowRepository",
 ]

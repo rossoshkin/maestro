@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 6 — WorkItem Resource
+Current milestone: Milestone 7 — Role Resource
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -444,6 +444,8 @@ Plans can be created, validated, versioned, approved, rejected, and superseded.
 
 # Milestone 6 — WorkItem Resource
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement `WorkItem` as the smallest schedulable unit of work.
@@ -504,6 +506,21 @@ Implement `WorkItem` as the smallest schedulable unit of work.
 ## Exit Criteria
 
 Work Items are fully modeled, persisted, and readiness can be determined deterministically.
+
+## Completion Notes
+
+- Added `WorkItem`, `WorkItemSpec`, `WorkItemStatus`, WorkItem phases, retry policy, Role references, Plan revision references, dependency references, requested Capabilities and verification evidence models.
+- Added WorkItem validation for Execution ownership, exact Plan revision binding, required Role references, required acceptance criteria, duplicate dependency references, duplicate requested Capabilities, self-dependencies and finite retry limits.
+- Added deterministic readiness evaluation for Pending WorkItems using persisted dependency snapshots.
+- Added dependency readiness behavior for waiting dependencies, missing dependencies, failed dependencies, blocked dependencies and dependency scope mismatches.
+- Added WorkItem transition validation, including bounded retry behavior after failure and terminal-state protection.
+- Added success evidence validation so Agent result artifacts alone cannot mark a WorkItem succeeded when verification commands are configured.
+- Added limited spec update behavior: execution, plan, planner Work Item ID and Role bindings are immutable, and specs cannot change after execution starts.
+- Added WorkItem repository protocol and SQLite persistence implementation with Execution, Plan and Plan Work Item ID lookup support.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run mypy src`
 
 ---
 

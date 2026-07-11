@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 8 — Agent Resource
+Current milestone: Milestone 9 — Capability System
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -608,6 +608,8 @@ Roles can be defined, validated, versioned, and referenced by Workflows and Work
 
 # Milestone 8 — Agent Resource
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement Agents as operational runtime configurations that fulfill compatible Roles.
@@ -664,6 +666,20 @@ Implement Agents as operational runtime configurations that fulfill compatible R
 ## Exit Criteria
 
 Agents can be registered, validated, and matched against Role requirements.
+
+## Completion Notes
+
+- Added `Agent`, `AgentSpec`, `AgentStatus`, Agent phases, Provider references, supported Role versions, CapabilityBinding references, capacity and scheduling configuration models.
+- Added Agent validation for provider references, model identifiers, duplicate supported Roles, duplicate supported Role versions, duplicate CapabilityBinding references and capacity-sensitive status.
+- Preserved the Role/Agent boundary: Agents reference Providers by resource name and do not embed Provider implementation details.
+- Preserved operational-only Agent semantics: Agent specs reject project references, knowledge bindings and other project memory fields.
+- Added Role compatibility evaluation for Role readiness, Role name support and exact Role version support.
+- Added Provider readiness evaluation for provider mismatch, pending/degraded/unavailable Provider state, unavailable model state, disabled scheduling and busy capacity.
+- Added Agent repository protocol and SQLite persistence implementation with Provider lookup and Role-version compatibility listing.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run mypy src`
 
 ---
 

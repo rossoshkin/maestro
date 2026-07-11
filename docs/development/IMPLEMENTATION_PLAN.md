@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 5 — Plan Resource
+Current milestone: Milestone 6 — WorkItem Resource
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -362,6 +362,8 @@ Workflow definitions can be registered, validated, versioned, and referenced by 
 
 # Milestone 5 — Plan Resource
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement immutable, versioned Plans generated for an Execution.
@@ -423,6 +425,20 @@ A Plan decomposes a Goal into Work Items.
 ## Exit Criteria
 
 Plans can be created, validated, versioned, approved, rejected, and superseded.
+
+## Completion Notes
+
+- Added `Plan`, `PlanSpec`, `PlanStatus`, Plan phases, validation results, Role references, risks and Work Item proposal models.
+- Added Plan validation for Execution ownership, positive versions, unique Work Item IDs, required Role references, required acceptance criteria, dependency target existence and acyclic dependency graphs.
+- Added immutable Plan version behavior: existing Plan specs cannot be changed; new versions are registered as distinct resources and can reference the revision they supersede.
+- Added Plan lifecycle transition validation for approval, rejection, invalidation and supersession states.
+- Added approval-ready status support and human audit metadata requirements for approved and rejected Plans.
+- Added Plan repository protocol and SQLite persistence implementation with exact Execution/version lookup.
+- Enforced one approved Plan per Execution at persistence level.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run mypy src`
 
 ---
 

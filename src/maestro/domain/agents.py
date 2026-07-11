@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Literal, Protocol, Self
+from typing import Literal, Protocol, Self
 
 from pydantic import Field, field_validator, model_validator
 
+from maestro.domain.modeling import ModelIdentifier
 from maestro.domain.projects import ReferenceVersion
 from maestro.domain.repositories import (
     ResourceRepository,
@@ -23,11 +24,6 @@ from maestro.domain.resources import (
     Status,
 )
 from maestro.domain.roles import Role, RolePhase
-
-ModelIdentifier = Annotated[
-    str,
-    Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/+\-]*$"),
-]
 
 
 class AgentPhase(StrEnum):

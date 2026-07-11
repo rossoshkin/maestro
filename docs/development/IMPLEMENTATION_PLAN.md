@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 10 — Provider Abstraction
+Current milestone: Milestone 11 — Workspace Abstraction
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -767,6 +767,8 @@ Capability admission is deterministic, tested, and usable by scheduler and runti
 
 # Milestone 10 — Provider Abstraction
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement model Provider interfaces and Provider resources.
@@ -824,6 +826,21 @@ Implement model Provider interfaces and Provider resources.
 ## Exit Criteria
 
 Maestro has a stable model-agnostic Provider contract.
+
+## Completion Notes
+
+- Added shared `ModelIdentifier` validation for Agent and Provider model references.
+- Added `Provider`, `ProviderSpec`, `ProviderStatus`, Provider phases, data policy, feature discovery, auth references, normalized failure details and allowed-model filtering.
+- Added model-agnostic Provider runtime contracts for health, model discovery, structured generation and tool-loop execution.
+- Added normalized Provider operation errors and timeout normalization.
+- Added `ProviderHealthService` to refresh Provider status from runtime health/model discovery without depending on a concrete Provider implementation.
+- Added deterministic `MockProvider` for structured generation, model discovery, tool-loop, unavailable-model and timeout tests.
+- Added Provider repository protocol and SQLite persistence implementation with namespace/name lookup.
+- Preserved Provider abstraction boundaries: domain code models Provider type as data and does not import Ollama, Codex, OpenAI or other concrete providers.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run mypy src`
 
 ---
 

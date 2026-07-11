@@ -10,6 +10,7 @@ from uuid import UUID
 
 from pydantic import Field, field_validator, model_validator
 
+from maestro.domain.capabilities import CapabilityName
 from maestro.domain.exceptions import (
     ResourceImmutableFieldError,
     ResourceTransitionError,
@@ -33,10 +34,6 @@ from maestro.domain.resources import (
 
 PlanWorkItemId = ResourceName
 NonEmptyText = Annotated[str, Field(min_length=1)]
-CapabilityName = Annotated[
-    str,
-    Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9.\-]*$"),
-]
 
 
 class WorkItemPhase(StrEnum):

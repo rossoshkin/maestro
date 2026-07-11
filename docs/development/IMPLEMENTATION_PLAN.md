@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 7 — Role Resource
+Current milestone: Milestone 8 — Agent Resource
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -526,6 +526,8 @@ Work Items are fully modeled, persisted, and readiness can be determined determi
 
 # Milestone 7 — Role Resource
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement versioned, declarative Roles.
@@ -586,6 +588,21 @@ A Role defines responsibility, schemas, Capabilities, and policies.
 ## Exit Criteria
 
 Roles can be defined, validated, versioned, and referenced by Workflows and Work Items.
+
+## Completion Notes
+
+- Added shared `CapabilityName` validation for Role policies and WorkItem requested Capabilities.
+- Added `Role`, `RoleSpec`, `RoleStatus`, Role phases, validation results, prompt references, schema references and execution policy models.
+- Added Role validation for required input and output schema references, bounded execution policy, duplicate Capabilities and invalid required/optional/prohibited Capability combinations.
+- Enforced provider and model independence through strict Role schema validation.
+- Enforced that Roles cannot request Workflow transition Capabilities while allowing them to explicitly prohibit those Capabilities.
+- Added effective Capability helpers so prohibited Capabilities deny optional grants.
+- Added immutable Role version behavior: existing Role specs cannot be changed; new versions are registered as distinct resources.
+- Added Role repository protocol and SQLite persistence implementation with exact `namespace/name/version` lookup.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run mypy src`
 
 ---
 

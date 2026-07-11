@@ -1,5 +1,6 @@
 """Provider-independent domain model for Maestro."""
 
+from maestro.domain.capabilities import CapabilityName
 from maestro.domain.exceptions import (
     MaestroDomainError,
     ResourceAlreadyExistsError,
@@ -78,8 +79,19 @@ from maestro.domain.resources import (
     Spec,
     Status,
 )
+from maestro.domain.roles import (
+    Role,
+    RoleExecutionPolicy,
+    RolePhase,
+    RolePromptReference,
+    RoleRepository,
+    RoleSpec,
+    RoleStatus,
+    RoleValidationResult,
+    SchemaReference,
+    apply_role_spec_update,
+)
 from maestro.domain.work_items import (
-    CapabilityName,
     WorkItem,
     WorkItemAgentReference,
     WorkItemDependencyReference,
@@ -171,6 +183,14 @@ __all__ = [
     "ProjectStatus",
     "RepositoryType",
     "ResourceAlreadyExistsError",
+    "Role",
+    "RoleExecutionPolicy",
+    "RolePhase",
+    "RolePromptReference",
+    "RoleRepository",
+    "RoleSpec",
+    "RoleStatus",
+    "RoleValidationResult",
     "ResourceConflictError",
     "ResourceImmutableFieldError",
     "ResourceNameNotFoundError",
@@ -179,6 +199,7 @@ __all__ = [
     "ResourceRepository",
     "ResourceSelector",
     "ResourceTransitionError",
+    "SchemaReference",
     "Spec",
     "Status",
     "TerminalOutcome",
@@ -220,6 +241,7 @@ __all__ = [
     "apply_execution_status_update",
     "apply_plan_spec_update",
     "apply_plan_status_update",
+    "apply_role_spec_update",
     "apply_work_item_spec_update",
     "apply_work_item_status_update",
     "apply_workflow_spec_update",

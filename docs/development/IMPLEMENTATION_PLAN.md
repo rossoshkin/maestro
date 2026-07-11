@@ -2,7 +2,11 @@
 
 Status: Living document
 
+Current milestone: Milestone 1 — Core Resource Framework
+
 ## Milestone 0 — Repository Bootstrap
+
+Status: Complete on 2026-07-11.
 
 Goal:
 Create a production-ready project skeleton.
@@ -31,6 +35,24 @@ Acceptance Criteria:
 
 Exit Criteria:
 Repository ready for domain implementation.
+
+Completion Notes:
+- Project metadata and dependency management are defined in `pyproject.toml`.
+- Runtime code uses a `src/` layout under the `maestro` package.
+- Package boundaries are prepared for domain, application, infrastructure and presentation layers.
+- FastAPI exposes `/health/live` and `/health/ready`.
+- Typer exposes the `maestro` CLI.
+- Configuration uses documented `MAESTRO_` environment variables.
+- Logging emits structured JSON records.
+- Verification completed:
+  - `uv sync`
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run ruff format --check .`
+  - `uv run mypy src`
+  - `uv run pre-commit run --all-files`
+  - `uv run maestro --help`
+  - `uv run uvicorn maestro.presentation.api:app --host 127.0.0.1 --port 8765`
 
 ## Milestone 1 — Core Resource Framework
 Deliverables:

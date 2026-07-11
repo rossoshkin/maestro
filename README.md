@@ -4,6 +4,117 @@
 
 Maestro is a local-first execution orchestration platform for coordinating specialized AI Roles across planning, implementation, review, and human approval.
 
+## Run Maestro Locally
+
+The current bootstrap milestone provides the local API process, health checks,
+configuration loading, structured logging, and the `maestro` CLI. Domain
+orchestration resources begin in the next milestone.
+
+### 1. Install `uv`
+
+Maestro uses `uv` for Python project management. On macOS with Homebrew:
+
+```bash
+brew install uv
+```
+
+Confirm it is available:
+
+```bash
+uv --version
+```
+
+### 2. Install Project Dependencies
+
+From the repository root:
+
+```bash
+uv sync
+```
+
+This creates a local `.venv/` and installs Maestro with its runtime and
+development dependencies.
+
+### 3. Check the CLI
+
+```bash
+uv run maestro --help
+```
+
+You should see the `serve` command listed.
+
+### 4. Start Maestro
+
+Use the CLI:
+
+```bash
+uv run maestro serve
+```
+
+By default Maestro binds to `127.0.0.1:7860`.
+
+You can override the bind address or port:
+
+```bash
+uv run maestro serve --host 127.0.0.1 --port 8765
+```
+
+The API can also be started directly with Uvicorn:
+
+```bash
+uv run uvicorn maestro.presentation.api:app --host 127.0.0.1 --port 7860
+```
+
+### 5. Verify Health
+
+In another terminal:
+
+```bash
+curl http://127.0.0.1:7860/health/live
+curl http://127.0.0.1:7860/health/ready
+```
+
+Both endpoints should return:
+
+```json
+{"status":"ok"}
+```
+
+### 6. Stop Maestro
+
+Press `Ctrl-C` in the terminal running the server.
+
+### Configuration
+
+Maestro reads configuration from environment variables prefixed with
+`MAESTRO_`.
+
+| Variable | Default |
+|---|---|
+| `MAESTRO_DATABASE_URL` | `sqlite:///./data/maestro.db` |
+| `MAESTRO_ARTIFACT_ROOT` | `./data/artifacts` |
+| `MAESTRO_WORKSPACE_ROOT` | `./data/workspaces` |
+| `MAESTRO_LOG_LEVEL` | `INFO` |
+| `MAESTRO_BIND_ADDRESS` | `127.0.0.1` |
+| `MAESTRO_PORT` | `7860` |
+
+Example:
+
+```bash
+MAESTRO_LOG_LEVEL=DEBUG MAESTRO_PORT=8765 uv run maestro serve
+```
+
+## Development Checks
+
+```bash
+uv sync
+uv run pytest
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src
+uv run pre-commit run --all-files
+```
+
 ## Glossary
 
 | Concept | Meaning |

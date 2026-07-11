@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 1 — Core Resource Framework
+Current milestone: Milestone 2 — Project
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -55,6 +55,9 @@ Completion Notes:
   - `uv run uvicorn maestro.presentation.api:app --host 127.0.0.1 --port 8765`
 
 ## Milestone 1 — Core Resource Framework
+
+Status: Complete on 2026-07-11.
+
 Deliverables:
 - BaseResource
 - Metadata
@@ -66,6 +69,19 @@ Acceptance:
 - serialization tests
 - validation tests
 - optimistic concurrency
+
+Completion Notes:
+- Added provider-independent resource primitives in `maestro.domain.resources`.
+- Added typed domain exceptions in `maestro.domain.exceptions`.
+- Added repository contracts and revision helpers in `maestro.domain.repositories`.
+- Implemented validation for canonical API version, resource names, metadata, conditions, observed generation, finalizer uniqueness and secret-like metadata.
+- Implemented optimistic concurrency helpers for spec and status updates.
+- Preserved generation semantics: spec changes increment `generation`; status changes do not.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run mypy src`
+  - `uv run pre-commit run --all-files`
 
 ## Milestone 2 — Project
 ## Milestone 3 — Execution

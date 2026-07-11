@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 3 — Execution Resource
+Current milestone: Milestone 4 — Workflow Resource
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -181,6 +181,8 @@ The Project resource is fully compliant with `RESOURCE_SPECIFICATION.md` and can
 
 # Milestone 3 — Execution Resource
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement `Execution` as Maestro's primary aggregate root.
@@ -249,6 +251,23 @@ An Execution represents one complete attempt to satisfy one Goal.
 ## Exit Criteria
 
 Execution lifecycle and persistence are complete and fully validated.
+
+## Completion Notes
+
+- Added `Goal`, `Execution`, `ExecutionSpec`, `ExecutionStatus`, limit configuration, suspension and cancellation desired-state fields.
+- Added the Execution phase enum and the valid transition matrix from `RESOURCE_SPECIFICATION.md`.
+- Added owner-reference validation requiring exactly one matching Project controller owner.
+- Added Execution repository protocol and SQLite persistence implementation.
+- Added Execution service operations for creation, spec updates, cancellation requests and suspension changes.
+- Enforced Project readiness on Execution creation through the Project repository.
+- Enforced Goal immutability after the Execution leaves `Draft`.
+- Enforced terminal Execution behavior: terminal phases do not transition except allowed archival paths.
+- Preserved generation semantics: Execution spec changes increment `generation`; status changes do not.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run mypy src`
+  - `uv run pre-commit run --all-files`
 
 ---
 

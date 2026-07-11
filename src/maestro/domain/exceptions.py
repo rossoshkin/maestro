@@ -35,6 +35,17 @@ class ResourceAlreadyExistsError(MaestroDomainError):
         super().__init__(f"{kind} already exists in namespace {namespace}: {name}")
 
 
+class ResourceImmutableFieldError(MaestroDomainError):
+    """Raised when an immutable field is changed."""
+
+    def __init__(self, resource_id: object, field_name: str) -> None:
+        self.resource_id = resource_id
+        self.field_name = field_name
+        super().__init__(
+            f"Immutable field change rejected for {resource_id}: {field_name}"
+        )
+
+
 class ResourceConflictError(MaestroDomainError):
     """Raised when optimistic concurrency detects a stale resource version."""
 
@@ -51,4 +62,22 @@ class ResourceConflictError(MaestroDomainError):
             "Resource version conflict for "
             f"{resource_id}: expected {expected_resource_version}, "
             f"actual {actual_resource_version}"
+        )
+
+
+class ResourceTransitionError(MaestroDomainError):
+    """Raised when a resource status transition is invalid."""
+
+    def __init__(
+        self,
+        resource_id: object,
+        current_phase: str,
+        next_phase: str,
+    ) -> None:
+        self.resource_id = resource_id
+        self.current_phase = current_phase
+        self.next_phase = next_phase
+        super().__init__(
+            f"Invalid phase transition for {resource_id}: "
+            f"{current_phase} -> {next_phase}"
         )

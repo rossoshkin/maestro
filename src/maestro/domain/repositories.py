@@ -118,6 +118,28 @@ def apply_status_update[ResourceT: BaseResource[Any, Any]](
     )
 
 
+def apply_deletion_mark[ResourceT: BaseResource[Any, Any]](
+    resource: ResourceT,
+    *,
+    expected_resource_version: int,
+    now: datetime | None = None,
+) -> ResourceT:
+    """Return a resource snapshot with deletionTimestamp set."""
+
+    ensure_expected_resource_version(resource, expected_resource_version)
+    timestamp = now or utc_now()
+    metadata = resource.metadata.model_copy(
+        update={
+            "resource_version": resource.metadata.resource_version + 1,
+            "updated_at": timestamp,
+            "deletion_timestamp": resource.metadata.deletion_timestamp or timestamp,
+        }
+    )
+    return validate_resource_snapshot(
+        resource.model_copy(update={"metadata": metadata})
+    )
+
+
 def validate_resource_snapshot[ResourceT: BaseResource[Any, Any]](
     resource: ResourceT,
 ) -> ResourceT:

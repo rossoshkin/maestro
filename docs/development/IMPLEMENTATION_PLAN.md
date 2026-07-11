@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 2 — Project
+Current milestone: Milestone 3 — Execution Resource
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -85,6 +85,8 @@ Completion Notes:
 
 # Milestone 2 — Project Resource
 
+Status: Complete on 2026-07-11.
+
 ## Goal
 
 Implement the `Project` resource as the root configuration object for a Maestro project.
@@ -159,6 +161,21 @@ A Project does not own runtime Execution state.
 ## Exit Criteria
 
 The Project resource is fully compliant with `RESOURCE_SPECIFICATION.md` and can be persisted reliably.
+
+## Completion Notes
+
+- Added `Project`, `ProjectSpec`, `ProjectStatus`, repository bindings, Role bindings, Knowledge Source bindings and Project policy models.
+- Added structural validation for repository bindings, Workflow references, duplicate repository IDs, duplicate Knowledge Source bindings and Project ownership.
+- Added Project repository protocol and SQLite persistence implementation.
+- Added Project service operations for create, spec update, archival and deletion requests.
+- Preserved repository safety: archive and deletion requests do not modify source repository paths.
+- Implemented optimistic concurrency through `resourceVersion`.
+- Preserved generation semantics: Project spec changes increment `generation`; status and deletion timestamp changes do not.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run mypy src`
+  - `uv run pre-commit run --all-files`
 
 ---
 
@@ -1702,3 +1719,67 @@ Requirements:
 - Add README instructions
 - Do not add a database
 - Do not add authentication
+## Deliverables
+
+- end-to-end test harness
+- fixture Git repository
+- restart-recovery scenario
+- failure scenarios
+- demo instructions
+- final architecture checklist
+- MVP release notes
+- implementation-plan status update
+
+---
+
+## Acceptance Criteria
+
+- human creates Goal;
+- Execution is persisted;
+- Planner generates valid Plan;
+- human approves Plan;
+- Workspace is created;
+- Coding Role modifies only Workspace;
+- verification runs independently;
+- Codex reviews immutable Artifacts;
+- repair loop works when requested;
+- human approves final result;
+- Execution reaches Completed;
+- every transition emits an Event;
+- every important output becomes an Artifact;
+- application restart does not lose Execution state;
+- source checkout remains untouched;
+- all tests, Ruff, and mypy pass;
+- documentation is current.
+
+---
+
+## Required Failure Scenarios
+
+- Ollama unavailable;
+- Codex unavailable;
+- invalid Planner output;
+- Coding tool timeout;
+- path traversal attempt;
+- failed verification;
+- Reviewer requests changes;
+- repair limit exceeded;
+- application restart while Execution is active;
+- stale resourceVersion update.
+
+---
+
+## Out of Scope
+
+- automatic Git push;
+- automatic merge;
+- remote workers;
+- multiple concurrent Executions;
+- cloud deployment;
+- Kubernetes deployment.
+
+---
+
+## Exit Criteria
+
+Maestro MVP is complete and ready for a `v0.1.0` local release.

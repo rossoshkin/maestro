@@ -15,6 +15,26 @@ class ResourceNotFoundError(MaestroDomainError):
         super().__init__(f"Resource not found: {resource_id}")
 
 
+class ResourceNameNotFoundError(MaestroDomainError):
+    """Raised when a repository cannot find a named resource."""
+
+    def __init__(self, kind: str, namespace: str, name: str) -> None:
+        self.kind = kind
+        self.namespace = namespace
+        self.name = name
+        super().__init__(f"{kind} not found in namespace {namespace}: {name}")
+
+
+class ResourceAlreadyExistsError(MaestroDomainError):
+    """Raised when a create operation would violate resource uniqueness."""
+
+    def __init__(self, kind: str, namespace: str, name: str) -> None:
+        self.kind = kind
+        self.namespace = namespace
+        self.name = name
+        super().__init__(f"{kind} already exists in namespace {namespace}: {name}")
+
+
 class ResourceConflictError(MaestroDomainError):
     """Raised when optimistic concurrency detects a stale resource version."""
 

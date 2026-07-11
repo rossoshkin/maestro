@@ -83,15 +83,1622 @@ Completion Notes:
   - `uv run mypy src`
   - `uv run pre-commit run --all-files`
 
-## Milestone 2 — Project
-## Milestone 3 — Execution
-## Milestone 4 — Workflow & Plan
-## Milestone 5 — WorkItem / Role / Agent
-## Milestone 6 — Workspace / Provider / Capability
-## Milestone 7 — Controllers
-## Milestone 8 — Planner
-## Milestone 9 — Coding
-## Milestone 10 — Verification & Review
-## Milestone 11 — REST API
-## Milestone 12 — Web UI
-## Milestone 13 — End-to-End MVP
+# Milestone 2 — Project Resource
+
+## Goal
+
+Implement the `Project` resource as the root configuration object for a Maestro project.
+
+A Project defines:
+
+- repositories;
+- Workflow binding;
+- Role bindings;
+- Knowledge Source bindings;
+- Project policies;
+- default configuration.
+
+A Project does not own runtime Execution state.
+
+## Architecture References
+
+- `docs/architecture/04_Domain_Model.md`
+- `docs/architecture/10_Knowledge.md`
+- `docs/development/RESOURCE_SPECIFICATION.md`
+
+## Dependencies
+
+- Milestone 1 — Common Resource Infrastructure
+
+## Deliverables
+
+- `Project`
+- `ProjectSpec`
+- `ProjectStatus`
+- repository binding models
+- Role binding models
+- Knowledge Source binding models
+- Project policy models
+- Project validation
+- Project repository interface
+- Project persistence implementation
+- Project service
+- serialization support
+- optimistic concurrency support
+
+## Acceptance Criteria
+
+- valid Projects serialize and deserialize correctly;
+- invalid repository bindings are rejected;
+- duplicate repository IDs are rejected;
+- missing Workflow bindings are rejected when required;
+- `generation` increments only when `spec` changes;
+- `resourceVersion` increments on every mutation;
+- stale updates return conflict errors;
+- deleting or archiving a Project never deletes source repositories.
+
+## Tests
+
+- model validation tests;
+- repository binding tests;
+- persistence round-trip tests;
+- optimistic concurrency tests;
+- generation tests;
+- resource version tests;
+- archive behavior tests.
+
+## Out of Scope
+
+- Execution;
+- Workflow implementation;
+- controllers;
+- REST API;
+- UI;
+- actual repository cloning.
+
+## Exit Criteria
+
+The Project resource is fully compliant with `RESOURCE_SPECIFICATION.md` and can be persisted reliably.
+
+---
+
+# Milestone 3 — Execution Resource
+
+## Goal
+
+Implement `Execution` as Maestro's primary aggregate root.
+
+An Execution represents one complete attempt to satisfy one Goal.
+
+## Architecture References
+
+- `docs/architecture/04_Domain_Model.md`
+- `docs/architecture/07_Execution.md`
+- `docs/architecture/13_State_Machine.md`
+- `docs/adr/0002-execution-aggregate.md`
+- `docs/development/RESOURCE_SPECIFICATION.md`
+
+## Dependencies
+
+- Milestone 1
+- Milestone 2
+
+## Deliverables
+
+- `Goal`
+- `Execution`
+- `ExecutionSpec`
+- `ExecutionStatus`
+- Execution phase enum
+- transition validation
+- Execution repository interface
+- persistence implementation
+- Execution service
+- owner-reference validation
+- limit configuration
+- suspension and cancellation fields
+
+## Acceptance Criteria
+
+- every Execution has exactly one Goal;
+- Execution references exactly one Project;
+- Execution references exactly one Workflow version;
+- illegal phase transitions are rejected;
+- terminal Executions cannot resume implicitly;
+- Goal mutation after Planning is rejected;
+- status remains controller-owned;
+- persistence survives restart;
+- owner references validate correctly.
+
+## Tests
+
+- phase transition tests;
+- terminal state tests;
+- Goal immutability tests;
+- owner reference tests;
+- persistence tests;
+- invalid Workflow reference tests;
+- cancellation request validation.
+
+## Out of Scope
+
+- controller reconciliation;
+- Workflow execution;
+- Planner;
+- Work Items;
+- API;
+- UI.
+
+## Exit Criteria
+
+Execution lifecycle and persistence are complete and fully validated.
+
+---
+
+# Milestone 4 — Workflow Resource
+
+## Goal
+
+Implement immutable, versioned Workflow definitions.
+
+A Workflow describes desired orchestration state. It does not execute code.
+
+## Architecture References
+
+- `docs/architecture/05_Workflows.md`
+- `docs/architecture/13_State_Machine.md`
+- `docs/adr/0001-control-plane.md`
+- `docs/development/RESOURCE_SPECIFICATION.md`
+
+## Dependencies
+
+- Milestone 1
+- Milestone 3
+
+## Deliverables
+
+- `Workflow`
+- `WorkflowSpec`
+- `WorkflowStatus`
+- Workflow step models
+- step-type enum
+- transition graph
+- graph validator
+- terminal-step validation
+- retry policy model
+- approval-step model
+- Role-step model
+- system-step model
+- fan-out model
+- decision-step model
+- immutable versioning support
+- Workflow repository
+
+## Acceptance Criteria
+
+- duplicate step IDs are rejected;
+- invalid entrypoints are rejected;
+- missing transition targets are rejected;
+- unreachable terminal states are rejected;
+- unbounded cycles are rejected;
+- retry counts must be finite;
+- Workflow versions are immutable;
+- Executions can pin exact Workflow versions;
+- Provider-specific details are prohibited.
+
+## Tests
+
+- graph validation tests;
+- cycle detection tests;
+- terminal reachability tests;
+- version immutability tests;
+- serialization tests;
+- invalid Role reference tests.
+
+## Out of Scope
+
+- Workflow controllers;
+- scheduler;
+- model invocation;
+- UI Workflow editor.
+
+## Exit Criteria
+
+Workflow definitions can be registered, validated, versioned, and referenced by Executions.
+
+---
+
+# Milestone 5 — Plan Resource
+
+## Goal
+
+Implement immutable, versioned Plans generated for an Execution.
+
+A Plan decomposes a Goal into Work Items.
+
+## Architecture References
+
+- `docs/architecture/04_Domain_Model.md`
+- `docs/architecture/05_Workflows.md`
+- `docs/development/RESOURCE_SPECIFICATION.md`
+
+## Dependencies
+
+- Milestone 3
+- Milestone 4
+
+## Deliverables
+
+- `Plan`
+- `PlanSpec`
+- `PlanStatus`
+- assumptions
+- questions
+- risks
+- Plan versioning
+- Plan validation
+- Work Item proposal models
+- Plan repository
+- approval-ready state
+- Plan supersession support
+
+## Acceptance Criteria
+
+- Plans belong to exactly one Execution;
+- Work Item IDs are unique within a Plan;
+- dependency graphs are acyclic;
+- every proposed Work Item has a Role;
+- every proposed Work Item has acceptance criteria;
+- approved Plans are immutable;
+- rejected Plans are superseded by new versions;
+- only one approved Plan exists per Execution.
+
+## Tests
+
+- Plan validation;
+- dependency-cycle tests;
+- immutable approved Plan tests;
+- supersession tests;
+- duplicate ID tests;
+- missing acceptance-criteria tests.
+
+## Out of Scope
+
+- Planner model integration;
+- human approval UI;
+- Work Item execution.
+
+## Exit Criteria
+
+Plans can be created, validated, versioned, approved, rejected, and superseded.
+
+---
+
+# Milestone 6 — WorkItem Resource
+
+## Goal
+
+Implement `WorkItem` as the smallest schedulable unit of work.
+
+## Architecture References
+
+- `docs/architecture/04_Domain_Model.md`
+- `docs/architecture/05_Workflows.md`
+- `docs/architecture/06_Roles.md`
+- `docs/development/RESOURCE_SPECIFICATION.md`
+
+## Dependencies
+
+- Milestone 3
+- Milestone 5
+
+## Deliverables
+
+- `WorkItem`
+- `WorkItemSpec`
+- `WorkItemStatus`
+- dependency references
+- requested Capabilities
+- retry policy
+- acceptance criteria
+- verification commands
+- Work Item repository
+- readiness evaluation
+- transition validation
+
+## Acceptance Criteria
+
+- every Work Item belongs to one Execution;
+- every Work Item belongs to one Plan version;
+- every Work Item references exactly one Role;
+- Work Items become Ready only after dependencies succeed;
+- failed dependencies block dependent Work Items;
+- retries are finite;
+- Agent output cannot directly mark Work Item success;
+- verification evidence is required for success where configured.
+
+## Tests
+
+- dependency readiness tests;
+- blocked-state tests;
+- retry-limit tests;
+- transition tests;
+- repository tests;
+- invalid Role reference tests.
+
+## Out of Scope
+
+- scheduler;
+- actual execution;
+- Agent assignment;
+- model calls.
+
+## Exit Criteria
+
+Work Items are fully modeled, persisted, and readiness can be determined deterministically.
+
+---
+
+# Milestone 7 — Role Resource
+
+## Goal
+
+Implement versioned, declarative Roles.
+
+A Role defines responsibility, schemas, Capabilities, and policies.
+
+## Architecture References
+
+- `docs/architecture/06_Roles.md`
+- `docs/adr/0003-role-vs-agent.md`
+- `docs/development/RESOURCE_SPECIFICATION.md`
+
+## Dependencies
+
+- Milestone 1
+- Milestone 6
+
+## Deliverables
+
+- `Role`
+- `RoleSpec`
+- `RoleStatus`
+- input schema reference
+- output schema reference
+- prompt reference
+- required Capabilities
+- optional Capabilities
+- prohibited Capabilities
+- execution policy
+- Role validation
+- Role repository
+- immutable Role versioning
+
+## Acceptance Criteria
+
+- Roles do not reference models;
+- Roles do not reference Providers;
+- Roles cannot request Workflow transition permissions;
+- input and output schema references are required;
+- Role versions are immutable;
+- prohibited Capabilities override optional and required Capabilities;
+- invalid Capability combinations are rejected.
+
+## Tests
+
+- Role validation;
+- immutable version tests;
+- prohibited Capability tests;
+- schema reference tests;
+- model/provider independence tests.
+
+## Out of Scope
+
+- Agent runtime;
+- prompt rendering;
+- model invocation.
+
+## Exit Criteria
+
+Roles can be defined, validated, versioned, and referenced by Workflows and Work Items.
+
+---
+
+# Milestone 8 — Agent Resource
+
+## Goal
+
+Implement Agents as operational runtime configurations that fulfill compatible Roles.
+
+## Architecture References
+
+- `docs/architecture/06_Roles.md`
+- `docs/adr/0003-role-vs-agent.md`
+- `docs/development/RESOURCE_SPECIFICATION.md`
+
+## Dependencies
+
+- Milestone 7
+- Milestone 10
+
+## Deliverables
+
+- `Agent`
+- `AgentSpec`
+- `AgentStatus`
+- supported Role versions
+- provider reference
+- model identifier
+- capacity
+- scheduling labels
+- readiness state
+- Agent repository
+- Role compatibility validator
+
+## Acceptance Criteria
+
+- Agents declare supported Role versions;
+- Agents reference Providers, not Provider implementations;
+- Agent state is operational only;
+- Agent does not contain project knowledge;
+- incompatible Role assignment is rejected;
+- unavailable Providers make Agents unavailable or degraded;
+- capacity limits are represented.
+
+## Tests
+
+- Role compatibility tests;
+- Provider readiness tests;
+- capacity tests;
+- Agent state tests;
+- invalid model/provider binding tests.
+
+## Out of Scope
+
+- scheduler;
+- actual invocation;
+- dynamic capacity allocation.
+
+## Exit Criteria
+
+Agents can be registered, validated, and matched against Role requirements.
+
+---
+
+# Milestone 9 — Capability System
+
+## Goal
+
+Implement Maestro's capability-based authorization model.
+
+Capabilities define permissions. Tools implement Capabilities.
+
+## Architecture References
+
+- `docs/architecture/08_Capabilities.md`
+- `docs/architecture/17_Security.md`
+- `docs/adr/0004-capabilities.md`
+- `docs/development/RESOURCE_SPECIFICATION.md`
+
+## Dependencies
+
+- Milestone 7
+- Milestone 8
+
+## Deliverables
+
+- `Capability`
+- `CapabilityBinding`
+- side-effect levels
+- Capability scopes
+- grant rules
+- deny rules
+- Capability resolver
+- admission checks
+- effective Capability calculation
+- policy-denial errors
+- Capability repository
+
+## Acceptance Criteria
+
+- deny-by-default behavior works;
+- explicit deny overrides grant;
+- Agents cannot self-grant Capabilities;
+- required Capabilities must be available before scheduling;
+- Planner cannot receive filesystem-write or shell-execute;
+- Reviewer cannot receive filesystem-write;
+- destructive Capabilities require explicit policy.
+
+## Tests
+
+- deny precedence tests;
+- effective Capability resolution tests;
+- Planner policy tests;
+- Reviewer policy tests;
+- missing required Capability tests;
+- scope tests.
+
+## Out of Scope
+
+- tool implementation;
+- shell execution;
+- remote authorization.
+
+## Exit Criteria
+
+Capability admission is deterministic, tested, and usable by scheduler and runtime.
+
+---
+
+# Milestone 10 — Provider Abstraction
+
+## Goal
+
+Implement model Provider interfaces and Provider resources.
+
+## Architecture References
+
+- `docs/architecture/11_Providers.md`
+- `docs/adr/0007-provider-interface.md`
+- `docs/development/RESOURCE_SPECIFICATION.md`
+
+## Dependencies
+
+- Milestone 1
+- Milestone 8
+
+## Deliverables
+
+- Provider resource models
+- Provider interface
+- health contract
+- model discovery contract
+- structured generation contract
+- tool-loop contract
+- timeout handling
+- Provider errors
+- mock Provider
+- Provider repository
+- Provider health service
+
+## Acceptance Criteria
+
+- domain code has no Provider-specific imports;
+- unavailable Providers report structured health status;
+- Provider capabilities are discoverable;
+- structured output contract is model-agnostic;
+- timeout and failure errors are normalized;
+- mock Provider supports deterministic tests.
+
+## Tests
+
+- Provider contract tests;
+- health tests;
+- timeout tests;
+- normalized-error tests;
+- model discovery tests;
+- mock Provider tests.
+
+## Out of Scope
+
+- Ollama implementation;
+- Codex implementation;
+- scheduler;
+- actual Role execution.
+
+## Exit Criteria
+
+Maestro has a stable model-agnostic Provider contract.
+
+---
+
+# Milestone 11 — Workspace Abstraction
+
+## Goal
+
+Implement Workspace resource, provider interface, and lifecycle.
+
+## Architecture References
+
+- `docs/architecture/09_Workspace.md`
+- `docs/architecture/17_Security.md`
+- `docs/adr/0006-workspaces.md`
+- `docs/development/RESOURCE_SPECIFICATION.md`
+
+## Dependencies
+
+- Milestone 2
+- Milestone 3
+- Milestone 9
+
+## Deliverables
+
+- Workspace resource
+- Workspace provider interface
+- Workspace lifecycle service
+- local Git worktree provider
+- branch-per-Execution behavior
+- path containment
+- symlink escape protection
+- cleanup finalizer
+- Workspace locking
+- diff collection
+- status collection
+- local command execution interface
+
+## Acceptance Criteria
+
+- Workspace never modifies the source checkout directly;
+- path traversal is rejected;
+- symlink escape is rejected;
+- cleanup never deletes the source repository;
+- one Execution can create an isolated worktree;
+- Workspace can collect Git status and diff;
+- failed cleanup preserves diagnostic state;
+- Workspace lifecycle survives restart.
+
+## Tests
+
+- worktree creation tests;
+- path traversal tests;
+- symlink escape tests;
+- cleanup tests;
+- source repository protection tests;
+- locking tests;
+- lifecycle tests.
+
+## Out of Scope
+
+- remote workers;
+- containers;
+- VMs;
+- network policy enforcement beyond local MVP limits.
+
+## Exit Criteria
+
+A safe local Workspace can be created, used, inspected, and cleaned.
+
+---
+
+# Milestone 12 — Artifact and Event Resources
+
+## Goal
+
+Implement immutable Artifacts and Events.
+
+## Architecture References
+
+- `docs/architecture/12_Event_System.md`
+- `docs/architecture/14_Persistence.md`
+- `docs/adr/0005-event-model.md`
+- `docs/development/RESOURCE_SPECIFICATION.md`
+
+## Dependencies
+
+- Milestone 1
+- Milestone 3
+- Milestone 6
+
+## Deliverables
+
+### Artifact
+
+- Artifact model
+- immutable storage metadata
+- checksum validation
+- provenance
+- Artifact repository
+- local Artifact storage
+
+### Event
+
+- Event model
+- sequence numbering per Execution
+- append-only Event store
+- correlation IDs
+- Event publisher interface
+- Event querying
+
+## Acceptance Criteria
+
+- Artifacts are immutable;
+- Artifact checksum mismatches are detected;
+- Events are append-only;
+- Events are ordered within an Execution;
+- duplicate Event delivery does not corrupt state;
+- resource state remains authoritative;
+- provenance is always recorded.
+
+## Tests
+
+- Artifact integrity tests;
+- immutable Artifact tests;
+- Event sequence tests;
+- duplicate Event tests;
+- Event persistence tests;
+- provenance tests.
+
+## Out of Scope
+
+- distributed Event bus;
+- Kafka;
+- object storage;
+- webhook delivery.
+
+## Exit Criteria
+
+Maestro can persist evidence and audit history reliably.
+
+---
+
+# Milestone 13 — Approval and Review Resources
+
+## Goal
+
+Implement first-class Approval and Review resources.
+
+## Architecture References
+
+- `docs/architecture/05_Workflows.md`
+- `docs/architecture/06_Roles.md`
+- `docs/architecture/17_Security.md`
+- `docs/development/RESOURCE_SPECIFICATION.md`
+
+## Dependencies
+
+- Milestone 5
+- Milestone 12
+
+## Deliverables
+
+### Approval
+
+- Approval model
+- immutable decisions
+- approval subject versioning
+- invalidation rules
+- approval repository
+
+### Review
+
+- Review model
+- verdicts
+- blocking findings
+- non-blocking findings
+- missing evidence
+- Review repository
+
+## Acceptance Criteria
+
+- approvals reference exact resource versions;
+- changed subjects invalidate approvals;
+- decisions are attributable;
+- Reviewer cannot mutate Workspace;
+- Review subjects are immutable Artifacts;
+- verdicts validate;
+- blocking and non-blocking findings remain distinct.
+
+## Tests
+
+- approval invalidation tests;
+- exact-subject-version tests;
+- immutable decision tests;
+- Review verdict tests;
+- missing evidence tests;
+- Reviewer read-only policy tests.
+
+## Out of Scope
+
+- Codex review invocation;
+- UI approval buttons;
+- automated approval policies.
+
+## Exit Criteria
+
+Approvals and Reviews are fully modeled and persisted.
+
+---
+
+# Milestone 14 — Controller Framework
+
+## Goal
+
+Implement the generic reconciliation framework used by Maestro controllers.
+
+## Architecture References
+
+- `docs/architecture/03_System_Architecture.md`
+- `docs/architecture/05_Workflows.md`
+- `docs/architecture/12_Event_System.md`
+- `docs/architecture/13_State_Machine.md`
+
+## Dependencies
+
+- Milestones 2–13
+
+## Deliverables
+
+- base controller protocol
+- reconciliation context
+- controller registry
+- reconcile queue
+- retry policy
+- optimistic concurrency handling
+- status writer
+- Condition helper
+- Event publisher integration
+- controller lifecycle
+- restart recovery
+
+## Acceptance Criteria
+
+- reconciliation is idempotent;
+- duplicate reconciliation is safe;
+- stale resource updates retry correctly;
+- controller failures preserve evidence;
+- status updates increment resourceVersion but not generation;
+- meaningful transitions emit Events;
+- restart resumes unfinished resources.
+
+## Tests
+
+- idempotency tests;
+- duplicate reconciliation tests;
+- stale-version tests;
+- restart recovery tests;
+- status ownership tests;
+- Event emission tests.
+
+## Out of Scope
+
+- model reasoning;
+- scheduler assignment logic;
+- API;
+- UI.
+
+## Exit Criteria
+
+Maestro can run deterministic, restart-safe controllers.
+
+---
+
+# Milestone 15 — Resource Controllers
+
+## Goal
+
+Implement the MVP resource-specific controllers.
+
+## Architecture References
+
+- `docs/architecture/05_Workflows.md`
+- `docs/architecture/07_Execution.md`
+- `docs/architecture/13_State_Machine.md`
+- `docs/development/RESOURCE_SPECIFICATION.md`
+
+## Dependencies
+
+- Milestone 14
+
+## Deliverables
+
+- ProjectController
+- ExecutionController
+- WorkflowController
+- PlanController
+- WorkItemController
+- WorkspaceController
+- ApprovalController
+- ReviewController
+- ArtifactController
+- ProviderController
+- AgentController
+
+## Acceptance Criteria
+
+- each controller owns only its resource status;
+- subordinate resources are created idempotently;
+- duplicate resources are not produced;
+- Conditions are updated consistently;
+- Execution advances only when evidence exists;
+- cancellation is reconciled safely;
+- terminal phases remain terminal.
+
+## Tests
+
+- controller-specific reconciliation tests;
+- duplicate subordinate-resource tests;
+- cancellation tests;
+- terminal state tests;
+- Condition update tests;
+- restart tests.
+
+## Out of Scope
+
+- Planner implementation;
+- coding execution;
+- reviewer implementation;
+- web UI.
+
+## Exit Criteria
+
+The resource graph can reconcile without model integrations.
+
+---
+
+# Milestone 16 — Scheduler
+
+## Goal
+
+Implement Agent selection and Work Item assignment.
+
+## Architecture References
+
+- `docs/architecture/03_System_Architecture.md`
+- `docs/architecture/06_Roles.md`
+- `docs/architecture/08_Capabilities.md`
+
+## Dependencies
+
+- Milestone 8
+- Milestone 9
+- Milestone 10
+- Milestone 14
+
+## Deliverables
+
+- scheduler service
+- Agent eligibility evaluation
+- Role compatibility checks
+- Capability admission
+- Provider health checks
+- capacity checks
+- Agent assignment
+- scheduling failure reasons
+- deterministic selection policy
+
+## Acceptance Criteria
+
+- incompatible Agents are rejected;
+- unhealthy Providers are avoided;
+- required Capabilities must resolve;
+- capacity limits are respected;
+- scheduler never selects by hard-coded model name;
+- scheduling decisions are logged and auditable;
+- no eligible Agent results in structured blocked state.
+
+## Tests
+
+- Agent compatibility tests;
+- capacity tests;
+- unhealthy Provider tests;
+- Capability admission tests;
+- deterministic-selection tests;
+- no-eligible-Agent tests.
+
+## Out of Scope
+
+- distributed queues;
+- GPU-aware scheduling;
+- remote workers;
+- parallel execution.
+
+## Exit Criteria
+
+Ready Work Items can be assigned to eligible local Agents deterministically.
+
+---
+
+# Milestone 17 — Ollama Provider
+
+## Goal
+
+Implement the initial local model Provider for Planner and Coding Roles.
+
+## Architecture References
+
+- `docs/architecture/11_Providers.md`
+- `docs/architecture/17_Security.md`
+- `docs/adr/0007-provider-interface.md`
+
+## Dependencies
+
+- Milestone 10
+
+## Deliverables
+
+- Ollama Provider adapter
+- health check
+- model listing
+- structured output
+- tool-calling loop support
+- request timeout
+- normalized Provider errors
+- retry-safe behavior
+- configuration validation
+
+## Acceptance Criteria
+
+- Provider health reflects actual endpoint state;
+- models can be listed;
+- structured Planner output can be parsed;
+- tool calls can be exchanged;
+- endpoint failures return normalized errors;
+- Provider-specific code remains in infrastructure;
+- tests use fake Ollama responses.
+
+## Tests
+
+- health tests;
+- model listing tests;
+- structured output tests;
+- tool-call tests;
+- timeout tests;
+- malformed-response tests.
+
+## Out of Scope
+
+- Codex;
+- remote worker execution;
+- model fallback.
+
+## Exit Criteria
+
+Local Ollama models can be invoked through the generic Provider interface.
+
+---
+
+# Milestone 18 — Planner Role Runtime
+
+## Goal
+
+Implement Planner Role invocation through Ollama.
+
+## Architecture References
+
+- `docs/architecture/05_Workflows.md`
+- `docs/architecture/06_Roles.md`
+- `docs/architecture/10_Knowledge.md`
+
+## Dependencies
+
+- Milestone 5
+- Milestone 7
+- Milestone 12
+- Milestone 15
+- Milestone 17
+
+## Deliverables
+
+- Planner prompt template
+- Planner input builder
+- Planner output schema
+- Plan parsing
+- one bounded repair attempt for invalid output
+- Plan Artifact creation
+- question handling
+- Plan resource creation
+- planning RoleInvocation records
+
+## Acceptance Criteria
+
+- Planner receives no write or shell Capabilities;
+- Planner output validates against schema;
+- invalid output gets one bounded repair attempt;
+- valid output creates immutable Plan and Artifacts;
+- blocking questions move Execution to WaitingForUserInput;
+- Planner never writes status directly;
+- all prompts and outputs are persisted.
+
+## Tests
+
+- valid Plan tests;
+- invalid JSON tests;
+- repair-attempt tests;
+- question-routing tests;
+- Capability denial tests;
+- Artifact creation tests.
+
+## Out of Scope
+
+- Knowledge retrieval beyond explicit supplied context;
+- coding execution;
+- UI.
+
+## Exit Criteria
+
+A Goal can produce a valid Plan and approval request.
+
+---
+
+# Milestone 19 — Coding Tool Runtime
+
+## Goal
+
+Implement safe tool execution for the Coding Role.
+
+## Architecture References
+
+- `docs/architecture/08_Capabilities.md`
+- `docs/architecture/09_Workspace.md`
+- `docs/architecture/17_Security.md`
+
+## Dependencies
+
+- Milestone 9
+- Milestone 11
+- Milestone 12
+- Milestone 17
+
+## Deliverables
+
+- list-files tool
+- read-file tool
+- write-file tool
+- edit-file tool
+- run-command tool
+- Git status tool
+- Git diff tool
+- tool schema registry
+- Capability enforcement
+- timeout handling
+- output truncation
+- audit logging
+- tool-result Artifacts
+
+## Acceptance Criteria
+
+- tools operate only inside Workspace;
+- denied Capabilities never execute;
+- path traversal is rejected;
+- symlink escapes are rejected;
+- commands run without sudo;
+- destructive commands are denied;
+- timeouts terminate processes;
+- tool calls and outputs are persisted;
+- output limits are enforced.
+
+## Tests
+
+- filesystem tool tests;
+- command policy tests;
+- timeout tests;
+- Capability enforcement tests;
+- path escape tests;
+- audit tests;
+- output truncation tests.
+
+## Out of Scope
+
+- remote shell;
+- Docker;
+- unrestricted network;
+- Git push.
+
+## Exit Criteria
+
+Coding Agents have a safe, auditable local tool environment.
+
+---
+
+# Milestone 20 — Coding Role Runtime
+
+## Goal
+
+Implement Coding Role execution through Ollama and the safe tool runtime.
+
+## Architecture References
+
+- `docs/architecture/06_Roles.md`
+- `docs/architecture/09_Workspace.md`
+- `docs/architecture/17_Security.md`
+
+## Dependencies
+
+- Milestone 16
+- Milestone 17
+- Milestone 19
+
+## Deliverables
+
+- Coding prompt template
+- Coding input builder
+- tool-loop orchestrator
+- max-step enforcement
+- max-duration enforcement
+- structured Coding result
+- changed-file collection
+- Coding RoleInvocation records
+- Coding summary Artifact
+- Git diff Artifact
+
+## Acceptance Criteria
+
+- Coding Agent operates only in assigned Workspace;
+- Coding Agent receives exactly the admitted Capabilities;
+- step and duration limits are enforced;
+- changed files are observed independently;
+- model claims are not trusted as verification;
+- Coding output is schema-validated;
+- Work Item cannot succeed based only on model response;
+- prompts, tool calls, outputs, and diff are persisted.
+
+## Tests
+
+- simple file creation scenario;
+- endpoint implementation fixture;
+- max-step tests;
+- invalid output tests;
+- blocked-task tests;
+- diff Artifact tests;
+- Workspace isolation tests.
+
+## Out of Scope
+
+- verification verdict;
+- review verdict;
+- automatic commit;
+- Git push.
+
+## Exit Criteria
+
+One Coding Work Item can be executed safely and produce inspectable Artifacts.
+
+---
+
+# Milestone 21 — Verification Controller
+
+## Goal
+
+Implement independent verification based on observed command results.
+
+## Architecture References
+
+- `docs/architecture/05_Workflows.md`
+- `docs/architecture/07_Execution.md`
+- `docs/architecture/17_Security.md`
+
+## Dependencies
+
+- Milestone 15
+- Milestone 19
+- Milestone 20
+
+## Deliverables
+
+- verification request model
+- verification controller
+- project-declared command execution
+- exit-code collection
+- stdout/stderr capture
+- verification report Artifact
+- verification Conditions
+- retry routing
+- failure categorization
+
+## Acceptance Criteria
+
+- verification commands come from approved Plan or Project configuration;
+- test success uses observed exit code;
+- model self-report is ignored;
+- failed verification produces structured evidence;
+- Execution routes to repair when allowed;
+- command timeout is enforced;
+- verification Artifacts are immutable.
+
+## Tests
+
+- successful verification;
+- failed tests;
+- timeout;
+- missing command;
+- repair routing;
+- Artifact generation;
+- restart recovery.
+
+## Out of Scope
+
+- Codex review;
+- static-analysis plugin ecosystem;
+- CI integration.
+
+## Exit Criteria
+
+Maestro independently determines whether implementation verification passed.
+
+---
+
+# Milestone 22 — Codex Reviewer Provider
+
+## Goal
+
+Implement Codex as the initial Reviewer Provider.
+
+## Architecture References
+
+- `docs/architecture/06_Roles.md`
+- `docs/architecture/11_Providers.md`
+- `docs/architecture/17_Security.md`
+
+## Dependencies
+
+- Milestone 10
+- Milestone 12
+- Milestone 13
+
+## Deliverables
+
+- Codex adapter
+- non-interactive invocation
+- read-only execution mode
+- Reviewer prompt builder
+- structured Review parser
+- timeout handling
+- normalized errors
+- review input packaging
+- mock Codex adapter for tests
+
+## Acceptance Criteria
+
+- Reviewer receives immutable Artifacts;
+- Reviewer has no write Capabilities;
+- structured Review validates;
+- Codex failures produce normalized errors;
+- missing evidence returns `UnableToReview`;
+- prompts and outputs are persisted;
+- Provider-specific code stays in infrastructure.
+
+## Tests
+
+- structured approve review;
+- request-changes review;
+- malformed output;
+- timeout;
+- missing Artifact;
+- read-only-policy test.
+
+## Out of Scope
+
+- cloud fallback;
+- reviewer ensembles;
+- automatic fixes.
+
+## Exit Criteria
+
+Codex can produce structured Reviews through the generic Reviewer contract.
+
+---
+
+# Milestone 23 — Review and Repair Workflow
+
+## Goal
+
+Connect verification, Codex review, bounded repair, and final approval.
+
+## Architecture References
+
+- `docs/architecture/05_Workflows.md`
+- `docs/architecture/13_State_Machine.md`
+- `docs/architecture/17_Security.md`
+
+## Dependencies
+
+- Milestone 20
+- Milestone 21
+- Milestone 22
+
+## Deliverables
+
+- Review Work Item creation
+- Review resource creation
+- verdict routing
+- request-changes routing
+- repair Work Item creation
+- iteration counters
+- maximum repair enforcement
+- final Approval resource
+- NeedsHumanDecision handling
+- terminal failure handling
+
+## Acceptance Criteria
+
+- `Approve` routes to final approval;
+- `RequestChanges` creates one repair iteration;
+- repair limits are enforced;
+- `NeedsHumanDecision` pauses for human input;
+- Reviewer never edits code;
+- new diff and verification Artifacts are produced after repair;
+- final approval references exact immutable subject versions;
+- rejection does not silently merge or discard changes.
+
+## Tests
+
+- approve path;
+- request-changes path;
+- repair success;
+- repair exhaustion;
+- NeedsHumanDecision path;
+- approval invalidation;
+- restart during repair.
+
+## Out of Scope
+
+- parallel review;
+- automatic merge;
+- multiple reviewers.
+
+## Exit Criteria
+
+The complete coding, verification, review, repair, and final approval loop works without UI.
+
+---
+
+# Milestone 24 — REST API
+
+## Goal
+
+Expose MVP resources and user actions through a versioned REST API.
+
+## Architecture References
+
+- `docs/architecture/15_Web_API.md`
+- `docs/development/API_STYLE_GUIDE.md`
+- `docs/development/RESOURCE_SPECIFICATION.md`
+
+## Dependencies
+
+- Milestones 2–23
+
+## Deliverables
+
+- FastAPI application
+- Project endpoints
+- Execution endpoints
+- Plan endpoints
+- Work Item endpoints
+- Artifact endpoints
+- Review endpoints
+- Approval actions
+- Provider and Agent status endpoints
+- pagination
+- label filtering
+- RFC 7807-style errors
+- optimistic concurrency support
+- OpenAPI documentation
+- SSE Execution event stream
+
+## Acceptance Criteria
+
+- clients cannot write resource status;
+- stale updates return conflict;
+- approval actions bind exact subject versions;
+- resource responses preserve metadata/spec/status;
+- API contains no orchestration logic;
+- errors are structured;
+- Execution progress can be streamed;
+- OpenAPI generation succeeds.
+
+## Tests
+
+- endpoint tests;
+- validation tests;
+- conflict tests;
+- status-write-denial tests;
+- approval tests;
+- pagination tests;
+- SSE tests;
+- error contract tests.
+
+## Out of Scope
+
+- authentication;
+- multi-user authorization;
+- GraphQL;
+- gRPC.
+
+## Exit Criteria
+
+The full MVP workflow can be driven through the API.
+
+---
+
+# Milestone 25 — Web UI
+
+## Goal
+
+Implement the minimal browser interface for one complete Execution.
+
+## Architecture References
+
+- `docs/architecture/16_Web_UI.md`
+- `docs/development/UI_GUIDELINES.md`
+
+## Dependencies
+
+- Milestone 24
+
+## Deliverables
+
+- Project list
+- Project detail
+- new Execution form
+- Plan view
+- Plan approval
+- Execution timeline
+- Work Item status
+- Agent invocation status
+- Artifact browser
+- diff viewer
+- verification report
+- Review findings
+- final approval
+- discard/cancel actions
+- live SSE updates
+
+## Acceptance Criteria
+
+- user can create an Execution;
+- user can inspect Goal and Plan;
+- user can approve or reject Plan;
+- current Workflow step is visible;
+- Events and Artifacts are inspectable;
+- diff and verification results are visible;
+- Review findings are visible;
+- user can make final approval decision;
+- UI contains no orchestration logic;
+- keyboard navigation works for primary flows.
+
+## Tests
+
+- template rendering;
+- approval integration;
+- live-update integration;
+- primary browser-flow tests;
+- basic accessibility tests;
+- error-state tests.
+
+## Out of Scope
+
+- authentication;
+- advanced dashboard;
+- visual Workflow editor;
+- mobile application;
+- theme system.
+
+## Exit Criteria
+
+The complete MVP workflow can be operated from a browser.
+
+---
+
+# Milestone 26 — End-to-End MVP
+
+## Goal
+
+Validate Maestro's complete local-first vertical workflow.
+
+## Architecture References
+
+- all architecture documents;
+- all applicable ADRs;
+- `RESOURCE_SPECIFICATION.md`;
+- `ARCHITECTURE_CHECKLIST.md`.
+
+## Dependencies
+
+- Milestones 0–25
+
+## Demo Scenario
+
+Use a small fixture repository.
+
+Goal:
+
+```text
+Create a minimal FastAPI application.
+
+Requirements:
+- GET /health returns {"status":"ok"}
+- Add one automated test
+- Add README instructions
+- Do not add a database
+- Do not add authentication

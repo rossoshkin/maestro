@@ -11,7 +11,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from maestro import __version__
@@ -26,6 +26,7 @@ from maestro.domain.approvals import (
     ApprovalDecision,
     ApprovalDecisionValue,
 )
+from maestro.domain.artifacts import ArtifactStorageError
 from maestro.domain.events import Event
 from maestro.domain.exceptions import (
     MaestroDomainError,
@@ -41,6 +42,7 @@ from maestro.domain.projects import ProjectSpec
 from maestro.domain.providers import Provider, ProviderSpec
 from maestro.domain.repositories import ResourceSelector
 from maestro.domain.resources import BaseResource, ResourceName
+from maestro.infrastructure.artifacts import LocalArtifactStorage
 from maestro.infrastructure.persistence import (
     SQLiteAgentRepository,
     SQLiteApprovalRepository,
@@ -51,9 +53,11 @@ from maestro.infrastructure.persistence import (
     SQLiteProjectRepository,
     SQLiteProviderRepository,
     SQLiteReviewRepository,
+    SQLiteRoleInvocationRepository,
     SQLiteWorkItemRepository,
 )
 from maestro.logging import configure_logging
+from maestro.presentation.web import ui_router
 
 
 class HealthResponse(BaseModel):
@@ -186,10 +190,12 @@ class ApiContext:
     plans: SQLitePlanRepository
     work_items: SQLiteWorkItemRepository
     artifacts: SQLiteArtifactRepository
+    artifact_storage: LocalArtifactStorage
     reviews: SQLiteReviewRepository
     approvals: SQLiteApprovalRepository
     providers: SQLiteProviderRepository
     agents: SQLiteAgentRepository
+    role_invocations: SQLiteRoleInvocationRepository
     events: SQLiteEventStore
 
     def close(self) -> None:
@@ -204,6 +210,7 @@ class ApiContext:
         self.approvals.close()
         self.providers.close()
         self.agents.close()
+        self.role_invocations.close()
         self.events.close()
 
 
@@ -240,6 +247,7 @@ def create_app(
         return HealthResponse(status="ok")
 
     api.include_router(_v1_router())
+    api.include_router(ui_router())
     return api
 
 
@@ -498,6 +506,38 @@ def _v1_router() -> APIRouter:
         return _dump_resource(await context.work_items.get(resource_id))
 
     @router.get(
+        "/role-invocations",
+        response_model=ResourceListResponse,
+        tags=["role-invocations"],
+    )
+    async def list_role_invocations(
+        context: ApiContextDep,
+        execution_id: ExecutionIdQuery = None,
+        namespace: NamespaceQuery = None,
+        label: LabelQuery = None,
+        limit: LimitQuery = 50,
+        cursor: CursorQuery = None,
+    ) -> ResourceListResponse:
+        selector = _selector(namespace, label)
+        resources = (
+            await context.role_invocations.list_by_execution(execution_id)
+            if execution_id is not None
+            else await context.role_invocations.list(selector)
+        )
+        return _list_response(
+            _filter_resources(resources, selector),
+            limit=limit,
+            cursor=cursor,
+        )
+
+    @router.get("/role-invocations/{resource_id}", tags=["role-invocations"])
+    async def get_role_invocation(
+        resource_id: UUID,
+        context: ApiContextDep,
+    ) -> dict[str, Any]:
+        return _dump_resource(await context.role_invocations.get(resource_id))
+
+    @router.get(
         "/artifacts",
         response_model=ResourceListResponse,
         tags=["artifacts"],
@@ -528,6 +568,24 @@ def _v1_router() -> APIRouter:
         context: ApiContextDep,
     ) -> dict[str, Any]:
         return _dump_resource(await context.artifacts.get(resource_id))
+
+    @router.get("/artifacts/{resource_id}/content", tags=["artifacts"])
+    async def get_artifact_content(
+        resource_id: UUID,
+        context: ApiContextDep,
+    ) -> Response:
+        artifact = await context.artifacts.get(resource_id)
+        content = await context.artifact_storage.read_bytes(artifact)
+        return Response(
+            content=content,
+            media_type=artifact.spec.media_type,
+            headers={
+                "X-Maestro-Artifact-Sha256": artifact.spec.sha256,
+                "X-Maestro-Artifact-Resource-Version": str(
+                    artifact.metadata.resource_version
+                ),
+            },
+        )
 
     @router.get("/reviews", response_model=ResourceListResponse, tags=["reviews"])
     async def list_reviews(
@@ -731,10 +789,12 @@ def create_api_context(settings: Settings) -> ApiContext:
         plans=SQLitePlanRepository(database_path),
         work_items=SQLiteWorkItemRepository(database_path),
         artifacts=SQLiteArtifactRepository(database_path),
+        artifact_storage=LocalArtifactStorage(settings.artifact_root),
         reviews=SQLiteReviewRepository(database_path),
         approvals=SQLiteApprovalRepository(database_path),
         providers=SQLiteProviderRepository(database_path),
         agents=SQLiteAgentRepository(database_path),
+        role_invocations=SQLiteRoleInvocationRepository(database_path),
         events=SQLiteEventStore(database_path),
     )
 
@@ -903,6 +963,7 @@ def _install_exception_handlers(api: FastAPI) -> None:
     api.add_exception_handler(ResourceConflictError, _conflict_handler)
     api.add_exception_handler(ResourceImmutableFieldError, _immutable_field_handler)
     api.add_exception_handler(ResourceTransitionError, _transition_handler)
+    api.add_exception_handler(ArtifactStorageError, _artifact_storage_handler)
     api.add_exception_handler(MaestroDomainError, _domain_handler)
     api.add_exception_handler(RequestValidationError, _validation_handler)
     api.add_exception_handler(HTTPException, _http_exception_handler)
@@ -1015,6 +1076,19 @@ async def _transition_handler(
             "currentPhase": str(typed_exc.current_phase),
             "nextPhase": str(typed_exc.next_phase),
         },
+    )
+
+
+async def _artifact_storage_handler(
+    request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    return _problem_response(
+        request,
+        status_code=status.HTTP_404_NOT_FOUND,
+        title="Artifact Content Unavailable",
+        detail=str(exc),
+        problem_type="https://maestro.dev/problems/artifact-content-unavailable",
     )
 
 

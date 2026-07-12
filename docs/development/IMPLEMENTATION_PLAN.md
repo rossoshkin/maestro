@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 25 — Web UI
+Current milestone: Milestone 26 — End-to-End MVP
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -1990,6 +1990,8 @@ The full MVP workflow can be driven through the API.
 
 # Milestone 25 — Web UI
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement the minimal browser interface for one complete Execution.
@@ -2054,6 +2056,24 @@ Implement the minimal browser interface for one complete Execution.
 ## Exit Criteria
 
 The complete MVP workflow can be operated from a browser.
+
+## Completion Notes
+
+- Added a browser UI at `/ui` and `/` with an execution-centric operational layout.
+- Added project list/detail, Execution list/detail and a new Execution form backed by the REST API.
+- Added Plan, Work Item, Role Invocation, Artifact, Review, Approval and Event views.
+- Added browser approval/rejection actions and Execution cancellation using the API action endpoints.
+- Added artifact content loading for diff and verification report inspection.
+- Added live SSE refresh wiring for Execution-related events.
+- Added read-only API endpoints for RoleInvocation resources and Artifact content to support UI evidence panels.
+- Kept workflow/orchestration behavior out of the UI; the browser only reads resources and invokes explicit API actions.
+- Added UI/API tests for shell rendering, accessibility landmarks and labels, SSE wiring, artifact content loading and invocation status data.
+- Verification completed:
+  - `uv run pytest tests/test_api.py`
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run ruff format --check .`
+  - `uv run mypy src`
 
 ---
 

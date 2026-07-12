@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from httpx import ASGITransport, AsyncClient, Response
 
+from maestro.application.artifacts import ArtifactService
 from maestro.config import Settings
 from maestro.domain.approvals import (
     Approval,
@@ -15,6 +16,11 @@ from maestro.domain.approvals import (
     ApprovalSpec,
     ApprovalSubjectReference,
     ApprovalType,
+)
+from maestro.domain.artifacts import (
+    ArtifactExecutionReference,
+    ArtifactProducer,
+    ArtifactType,
 )
 from maestro.domain.events import EventDraft, EventExecutionReference
 from maestro.domain.executions import (
@@ -32,7 +38,15 @@ from maestro.domain.projects import (
     WorkflowReference,
 )
 from maestro.domain.resources import ResourceReference
-from maestro.presentation.api import create_api_context, create_app
+from maestro.domain.role_invocations import (
+    RoleInvocation,
+    RoleInvocationAgentReference,
+    RoleInvocationExecutionReference,
+    RoleInvocationLimits,
+    RoleInvocationRoleReference,
+    RoleInvocationSpec,
+)
+from maestro.presentation.api import ApiContext, create_api_context, create_app
 
 
 def api_settings(tmp_path: Path) -> Settings:
@@ -75,15 +89,12 @@ async def _get(settings: Settings, path: str) -> Response:
 
 
 async def create_ready_project(
-    context: object,
+    context: ApiContext,
     *,
     name: str = "tour-manager",
 ) -> Project:
-    typed_context = context
-    project = await typed_context.projects.create(
-        Project.new(name=name, spec=project_spec())
-    )
-    return await typed_context.projects.update_status(
+    project = await context.projects.create(Project.new(name=name, spec=project_spec()))
+    return await context.projects.update_status(
         project.metadata.id,
         ProjectStatus(phase=ProjectPhase.READY),
         expected_resource_version=project.metadata.resource_version,
@@ -427,3 +438,117 @@ def test_openapi_generation_includes_v1_paths(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert "/api/v1/projects" in payload["paths"]
     assert "/api/v1/approvals/{resource_id}/actions/approve" in payload["paths"]
+
+
+def test_ui_shell_and_assets_render_browser_surface(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        settings = api_settings(tmp_path)
+        context = create_api_context(settings)
+        app = create_app(settings, api_context=context)
+        transport = ASGITransport(app=app)
+        try:
+            async with AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                shell = await client.get("/ui")
+                styles = await client.get("/ui/styles.css")
+                script = await client.get("/ui/app.js")
+
+                assert shell.status_code == 200
+                assert "text/html" in shell.headers["content-type"]
+                assert 'id="main"' in shell.text
+                assert "New Execution" in shell.text
+                assert "Approvals" in shell.text
+                assert 'role="alert"' in shell.text
+                assert "<label>" in shell.text
+                assert styles.status_code == 200
+                assert "text/css" in styles.headers["content-type"]
+                assert ".workspace" in styles.text
+                assert script.status_code == 200
+                assert "application/javascript" in script.headers["content-type"]
+                assert "EventSource" in script.text
+                assert "/role-invocations" in script.text
+                assert "loadArtifactContent" in script.text
+        finally:
+            context.close()
+
+    asyncio.run(scenario())
+
+
+def test_artifact_content_and_invocation_endpoints_feed_ui(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        settings = api_settings(tmp_path)
+        context = create_api_context(settings)
+        app = create_app(settings, api_context=context)
+        transport = ASGITransport(app=app)
+        try:
+            project = await create_ready_project(context)
+            execution = await context.executions.create(
+                Execution.new(name="add-health", spec=execution_spec(project))
+            )
+            artifact = await ArtifactService(
+                context.artifacts,
+                context.artifact_storage,
+            ).create_bytes_artifact(
+                name="health-diff",
+                execution_ref=ArtifactExecutionReference(
+                    id=execution.metadata.id,
+                    name=execution.metadata.name,
+                ),
+                artifact_type=ArtifactType.GIT_DIFF,
+                media_type="text/x-diff",
+                content=b"diff --git a/app.py b/app.py\n",
+                producer=ArtifactProducer(subsystem="test"),
+            )
+            invocation = await context.role_invocations.create(
+                RoleInvocation.new(
+                    name="coding-invocation",
+                    spec=RoleInvocationSpec(
+                        executionRef=RoleInvocationExecutionReference(
+                            id=execution.metadata.id,
+                            name=execution.metadata.name,
+                        ),
+                        roleRef=RoleInvocationRoleReference(
+                            name="coding",
+                            version="v1alpha1",
+                        ),
+                        agentRef=RoleInvocationAgentReference(
+                            id=uuid4(),
+                            name="coder-local",
+                        ),
+                        limits=RoleInvocationLimits(
+                            maxSteps=12,
+                            maxDurationSeconds=60,
+                        ),
+                    ),
+                )
+            )
+
+            async with AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                content = await client.get(
+                    f"/api/v1/artifacts/{artifact.metadata.id}/content"
+                )
+                invocations = await client.get(
+                    "/api/v1/role-invocations",
+                    params={"executionId": str(execution.metadata.id)},
+                )
+
+                assert content.status_code == 200
+                assert content.headers["content-type"].startswith("text/x-diff")
+                assert "diff --git" in content.text
+                assert invocations.status_code == 200
+                payload = invocations.json()
+                assert payload["items"][0]["metadata"]["id"] == str(
+                    invocation.metadata.id
+                )
+                assert payload["items"][0]["spec"]["agentRef"]["name"] == "coder-local"
+        finally:
+            context.close()
+
+    asyncio.run(scenario())

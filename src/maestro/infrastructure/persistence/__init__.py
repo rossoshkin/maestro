@@ -3,6 +3,9 @@
 from maestro.infrastructure.persistence.sqlite_agent_repository import (
     SQLiteAgentRepository,
 )
+from maestro.infrastructure.persistence.sqlite_approval_repository import (
+    SQLiteApprovalRepository,
+)
 from maestro.infrastructure.persistence.sqlite_artifact_repository import (
     SQLiteArtifactRepository,
 )
@@ -23,6 +26,9 @@ from maestro.infrastructure.persistence.sqlite_project_repository import (
 from maestro.infrastructure.persistence.sqlite_provider_repository import (
     SQLiteProviderRepository,
 )
+from maestro.infrastructure.persistence.sqlite_review_repository import (
+    SQLiteReviewRepository,
+)
 from maestro.infrastructure.persistence.sqlite_role_repository import (
     SQLiteRoleRepository,
 )
@@ -38,6 +44,7 @@ from maestro.infrastructure.persistence.sqlite_workspace_repository import (
 
 __all__ = [
     "SQLiteAgentRepository",
+    "SQLiteApprovalRepository",
     "SQLiteArtifactRepository",
     "SQLiteCapabilityBindingRepository",
     "SQLiteCapabilityRepository",
@@ -46,6 +53,7 @@ __all__ = [
     "SQLitePlanRepository",
     "SQLiteProjectRepository",
     "SQLiteProviderRepository",
+    "SQLiteReviewRepository",
     "SQLiteRoleRepository",
     "SQLiteWorkItemRepository",
     "SQLiteWorkspaceRepository",

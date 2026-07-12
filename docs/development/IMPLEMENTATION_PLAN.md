@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 13 — Approval and Review Resources
+Current milestone: Milestone 14 — Controller Framework
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -1018,6 +1018,8 @@ Maestro can persist evidence and audit history reliably.
 
 # Milestone 13 — Approval and Review Resources
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement first-class Approval and Review resources.
@@ -1081,6 +1083,21 @@ Implement first-class Approval and Review resources.
 ## Exit Criteria
 
 Approvals and Reviews are fully modeled and persisted.
+
+## Completion Notes
+
+- Added `Approval` resources with exact subject `resourceVersion` references, Execution ownership, approval phases, attributable decisions and immutable decision-history validation.
+- Added Approval invalidation rules for changed, deleted or mismatched subjects.
+- Added `ApprovalService` for persisting decisions and subject invalidation checks.
+- Added SQLite Approval persistence with list-by-Execution, list-by-subject, immutable spec updates and optimistic concurrency.
+- Added `Review` resources with exact Artifact subject references, read-only reviewer policy, verdict semantics, structured findings, missing evidence and completion metadata.
+- Added validation that Reviewer policy cannot allow Workspace mutation and that blocking/non-blocking findings remain distinct.
+- Added SQLite Review persistence with list-by-Execution, list-by-WorkItem, immutable spec updates and optimistic concurrency.
+- Added domain, persistence and application tests for approval invalidation, exact subject versions, immutable decisions, review verdicts, missing evidence and reviewer read-only policy.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run mypy src`
 
 ---
 

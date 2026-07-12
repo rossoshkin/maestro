@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 15 — Resource Controllers
+Current milestone: Milestone 16 — Scheduler
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -1183,6 +1183,8 @@ Maestro can run deterministic, restart-safe controllers.
 
 # Milestone 15 — Resource Controllers
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement the MVP resource-specific controllers.
@@ -1241,6 +1243,22 @@ Implement the MVP resource-specific controllers.
 ## Exit Criteria
 
 The resource graph can reconcile without model integrations.
+
+## Completion Notes
+
+- Added MVP resource controllers in `maestro.application.resource_controllers`.
+- Implemented status-only reconciliation for Project, Workflow, Workspace, Approval, Review, Artifact, Provider and Agent resources.
+- Implemented Plan approval reconciliation with exact resource-version matching.
+- Implemented idempotent WorkItem materialization from approved Plans, including dependency reference reconciliation without duplicate WorkItems.
+- Implemented WorkItem readiness reconciliation from dependency evidence and retry exhaustion handling.
+- Implemented Execution phase reconciliation from persisted Plan, Workspace, WorkItem, Review and Approval evidence.
+- Preserved terminal Execution phases and safe cancellation reconciliation.
+- Added controller-specific tests covering idempotent subordinate creation, Conditions, evidence-driven Execution advancement, cancellation and terminal no-op behavior.
+- Verification completed:
+  - `env UV_CACHE_DIR=.uv-cache uv run pytest`
+  - `env UV_CACHE_DIR=.uv-cache uv run ruff check .`
+  - `env UV_CACHE_DIR=.uv-cache uv run mypy src`
+  - `env UV_CACHE_DIR=.uv-cache PRE_COMMIT_HOME=.pre-commit-cache uv run pre-commit run --all-files`
 
 ---
 

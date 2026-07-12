@@ -29,6 +29,9 @@ from maestro.infrastructure.persistence.sqlite_provider_repository import (
 from maestro.infrastructure.persistence.sqlite_review_repository import (
     SQLiteReviewRepository,
 )
+from maestro.infrastructure.persistence.sqlite_role_invocation_repository import (
+    SQLiteRoleInvocationRepository,
+)
 from maestro.infrastructure.persistence.sqlite_role_repository import (
     SQLiteRoleRepository,
 )
@@ -54,6 +57,7 @@ __all__ = [
     "SQLiteProjectRepository",
     "SQLiteProviderRepository",
     "SQLiteReviewRepository",
+    "SQLiteRoleInvocationRepository",
     "SQLiteRoleRepository",
     "SQLiteWorkItemRepository",
     "SQLiteWorkspaceRepository",

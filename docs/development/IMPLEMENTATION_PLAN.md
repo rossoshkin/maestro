@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 18 — Planner Role Runtime
+Current milestone: Milestone 19 — Coding Tool Runtime
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -1479,6 +1479,16 @@ Implement Planner Role invocation through Ollama.
 ## Exit Criteria
 
 A Goal can produce a valid Plan and approval request.
+
+## Completion Notes
+
+- Added the Planner Role runtime with prompt construction, provider-independent input context and structured output validation.
+- Added a bounded one-attempt repair flow for invalid Planner output.
+- Persisted Planner prompt, model response and Plan Artifacts with RoleInvocation provenance.
+- Added durable planning RoleInvocation records, including provider/model status, limits, granted Capabilities and terminal failure details.
+- Enforced Planner Capability denial for filesystem write/edit and shell execution grants before provider invocation.
+- Routed blocking Planner questions to `WaitingForUserInput` without creating a Plan.
+- Added tests for valid Plans, invalid output, bounded repair, question routing, Capability denial and Artifact creation.
 
 ---
 

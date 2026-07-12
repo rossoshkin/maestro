@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 16 — Scheduler
+Current milestone: Milestone 17 — Ollama Provider
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -1264,6 +1264,8 @@ The resource graph can reconcile without model integrations.
 
 # Milestone 16 — Scheduler
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement Agent selection and Work Item assignment.
@@ -1322,6 +1324,23 @@ Implement Agent selection and Work Item assignment.
 ## Exit Criteria
 
 Ready Work Items can be assigned to eligible local Agents deterministically.
+
+## Completion Notes
+
+- Added deterministic WorkItem scheduling in `maestro.application.scheduler`.
+- Implemented Agent eligibility evaluation across Role compatibility, Provider readiness, model availability, capacity and Capability admission.
+- Enforced deny-by-default Capability resolution using Ready CapabilityBindings referenced by Agents.
+- Implemented deterministic Agent selection by eligibility, priority, current assignment count and name.
+- Implemented Ready WorkItem assignment through `assignedAgentRef` and the Ready to Scheduled transition.
+- Implemented structured blocked Scheduling conditions when no eligible Agent can accept a WorkItem.
+- Added auditable scheduler decision events for scheduled and blocked outcomes.
+- Added scheduler tests covering compatible assignment, capacity, unhealthy Providers, Capability denial, deterministic selection and no-eligible-Agent blocking.
+- Verification completed:
+  - `env UV_CACHE_DIR=.uv-cache uv run pytest`
+  - `env UV_CACHE_DIR=.uv-cache uv run ruff check .`
+  - `env UV_CACHE_DIR=.uv-cache uv run ruff format --check .`
+  - `env UV_CACHE_DIR=.uv-cache uv run mypy src`
+  - `env UV_CACHE_DIR=.uv-cache PRE_COMMIT_HOME=.pre-commit-cache uv run pre-commit run --all-files`
 
 ---
 

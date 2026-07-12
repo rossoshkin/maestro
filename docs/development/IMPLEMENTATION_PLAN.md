@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 24 — REST API
+Current milestone: Milestone 25 — Web UI
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -1899,6 +1899,8 @@ The complete coding, verification, review, repair, and final approval loop works
 
 # Milestone 24 — REST API
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Expose MVP resources and user actions through a versioned REST API.
@@ -1963,6 +1965,26 @@ Expose MVP resources and user actions through a versioned REST API.
 ## Exit Criteria
 
 The full MVP workflow can be driven through the API.
+
+## Completion Notes
+
+- Replaced the bootstrap-only FastAPI app with a versioned `/api/v1` REST surface.
+- Added Project and Execution create/read/spec-update endpoints with optimistic concurrency.
+- Added Execution cancel, suspend and resume action endpoints.
+- Added read/list endpoints for Plans, Work Items, Artifacts, Reviews, Approvals, Providers and Agents.
+- Added Provider and Agent create/spec-update endpoints while keeping status writes internal.
+- Added Approval approve/reject actions that require the caller to bind the exact subject resourceVersion.
+- Added shared pagination, namespace filtering and repeatable `label=key=value` selectors for list endpoints.
+- Added RFC 7807-style problem details for validation, not found, conflict, immutable-field and transition errors.
+- Added `/api/v1/executions/{id}/events` and SSE `/api/v1/executions/{id}/events/stream`.
+- Kept orchestration logic out of the API; routes delegate to application services and repositories.
+- Added endpoint tests for resource shape, status-write denial, conflict handling, approval subject-version binding, pagination, SSE and OpenAPI generation.
+- Verification completed:
+  - `uv run pytest tests/test_api.py`
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run ruff format --check .`
+  - `uv run mypy src`
 
 ---
 

@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 21 — Verification Controller
+Current milestone: Milestone 22 — Codex Reviewer Provider
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -1659,6 +1659,8 @@ One Coding Work Item can be executed safely and produce inspectable Artifacts.
 
 # Milestone 21 — Verification Controller
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement independent verification based on observed command results.
@@ -1716,6 +1718,22 @@ Implement independent verification based on observed command results.
 ## Exit Criteria
 
 Maestro independently determines whether implementation verification passed.
+
+## Completion Notes
+
+- Added an independent WorkItem verification controller with durable request, command-evidence, report and controller-result models.
+- Executed only persisted WorkItem verification commands materialized from the approved Plan, using `shlex` parsing and the shared Workspace command-policy helper before provider execution.
+- Captured observed exit codes, stdout, stderr, truncation state, timeout state and structured failure categories for every verification command.
+- Persisted immutable command-output Artifacts and verification-report Artifacts with WorkItem provenance and source references.
+- Updated WorkItem verification status from observed command results only, marking successful WorkItems `Succeeded` and failed verification `Failed`.
+- Routed repair through existing WorkItem retry behavior by preserving failed WorkItems for the WorkItem controller to return to `Ready` when attempts remain.
+- Added restart recovery support for unfinished `Verifying` WorkItems through the controller runtime recovery predicate.
+- Added tests for successful verification, failed tests, timeout handling, missing commands, repair routing, Artifact generation and restart recovery.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run ruff format --check .`
+  - `uv run mypy src`
 
 ---
 

@@ -560,6 +560,24 @@ def default_tool_definitions() -> tuple[ToolDefinition, ...]:
     )
 
 
+def validate_workspace_command(
+    root: Path,
+    command: tuple[str, ...],
+    *,
+    capability: CapabilityName = "shell.execute.test",
+) -> None:
+    """Validate a command against Maestro's local Workspace command policy."""
+
+    _validate_command_policy(command)
+    _validate_command_path_arguments(root, command, capability)
+
+
+def truncate_text(value: str, max_bytes: int) -> tuple[str, bool]:
+    """Truncate text to the configured byte limit."""
+
+    return _truncate_text(value, max_bytes)
+
+
 def _definition_is_admitted(
     definition: ToolDefinition,
     granted_capabilities: tuple[CapabilityName, ...],

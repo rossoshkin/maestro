@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 19 — Coding Tool Runtime
+Current milestone: Milestone 20 — Coding Role Runtime
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -1559,6 +1559,18 @@ Implement safe tool execution for the Coding Role.
 ## Exit Criteria
 
 Coding Agents have a safe, auditable local tool environment.
+
+## Completion Notes
+
+- Added the Coding tool runtime and provider-facing tool schema registry.
+- Implemented `list-files`, `read-file`, `write-file`, `edit-file`, `run-command`, `git-status` and `git-diff`.
+- Enforced per-tool Capabilities before any filesystem, command or Git operation executes.
+- Reused Workspace path resolution to reject traversal, symlink escapes and secret-like paths.
+- Added command policy denial for privileged/destructive commands including `sudo`, `rm -rf`, `git push`, `git reset --hard` and shell `-c`.
+- Routed command and Git execution through `WorkspaceProvider`, with Workspace policy timeout capping.
+- Added output truncation and persisted tool-result Artifacts for successful, failed and denied calls.
+- Added `ToolCallRecorded` audit events for each tool invocation.
+- Added tests for filesystem tools, command policy, timeout capping, Capability denial, path escape handling, audit events and output truncation.
 
 ---
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,7 @@ from maestro.domain.artifacts import (
 )
 from maestro.domain.executions import (
     Execution,
+    ExecutionLimits,
     ExecutionPhase,
     ExecutionSpec,
     ExecutionStatus,
@@ -104,6 +106,9 @@ from maestro.domain.reviews import (
     Review,
     ReviewArtifactReference,
     ReviewExecutionReference,
+    ReviewFinding,
+    ReviewFindingCategory,
+    ReviewFindingSeverity,
     ReviewPhase,
     ReviewRoleReference,
     ReviewSpec,
@@ -498,6 +503,188 @@ def artifact_resource(execution_id: UUID) -> Artifact:
     )
 
 
+@dataclass(frozen=True)
+class ReviewWorkflowHarness:
+    executions: SQLiteExecutionRepository
+    work_items: SQLiteWorkItemRepository
+    artifacts: SQLiteArtifactRepository
+    reviews: SQLiteReviewRepository
+    approvals: SQLiteApprovalRepository
+    controller: ExecutionController
+    execution: Execution
+    work_item: WorkItem
+
+    def close(self) -> None:
+        self.executions.close()
+        self.work_items.close()
+        self.artifacts.close()
+        self.reviews.close()
+        self.approvals.close()
+
+
+async def review_workflow_harness(
+    *,
+    max_review_iterations: int = 2,
+    review_iteration: int = 0,
+) -> ReviewWorkflowHarness:
+    executions = SQLiteExecutionRepository(":memory:")
+    work_items = SQLiteWorkItemRepository(":memory:")
+    artifacts = SQLiteArtifactRepository(":memory:")
+    reviews = SQLiteReviewRepository(":memory:")
+    approvals = SQLiteApprovalRepository(":memory:")
+    spec = execution_spec().model_copy(
+        update={
+            "limits": ExecutionLimits(maxReviewIterations=max_review_iterations),
+        }
+    )
+    created_execution = await executions.create(
+        Execution.new(name="add-health-endpoint", spec=spec)
+    )
+    work_item = await work_items.create(
+        WorkItem.new(
+            name="add-health",
+            spec=work_item_spec(
+                created_execution.metadata.id,
+                uuid4(),
+            ),
+        )
+    )
+    succeeded = await succeed_work_item(work_items, work_item)
+    await create_review_artifacts(artifacts, created_execution, succeeded)
+
+    reviewing = created_execution
+    for phase in (
+        ExecutionPhase.PLANNING,
+        ExecutionPhase.WAITING_FOR_PLAN_APPROVAL,
+        ExecutionPhase.PREPARING_WORKSPACE,
+        ExecutionPhase.EXECUTING,
+        ExecutionPhase.VERIFYING,
+        ExecutionPhase.REVIEWING,
+    ):
+        updates: dict[str, Any] = {"phase": phase}
+        if phase == ExecutionPhase.REVIEWING:
+            updates["iteration"] = reviewing.status.iteration.model_copy(
+                update={"review": review_iteration}
+            )
+        reviewing = await executions.update_status(
+            reviewing.metadata.id,
+            reviewing.status.model_copy(update=updates),
+            expected_resource_version=reviewing.metadata.resource_version,
+        )
+
+    controller = ExecutionController(
+        executions,
+        work_item_repository=work_items,
+        artifact_repository=artifacts,
+        review_repository=reviews,
+        approval_repository=approvals,
+    )
+    return ReviewWorkflowHarness(
+        executions=executions,
+        work_items=work_items,
+        artifacts=artifacts,
+        reviews=reviews,
+        approvals=approvals,
+        controller=controller,
+        execution=reviewing,
+        work_item=succeeded,
+    )
+
+
+async def create_review_artifacts(
+    repository: SQLiteArtifactRepository,
+    execution: Execution,
+    work_item: WorkItem,
+    *,
+    suffix: str = "initial",
+) -> tuple[Artifact, ...]:
+    artifact_specs = (
+        (ArtifactType.GIT_DIFF, "text/x-diff", b"diff\n"),
+        (ArtifactType.VERIFICATION_REPORT, "application/json", b'{"ok": true}\n'),
+    )
+    created: list[Artifact] = []
+    for artifact_type, media_type, content in artifact_specs:
+        name = f"{work_item.spec.plan_work_item_id}-{artifact_type}-{suffix}"[:63]
+        artifact = await repository.create(
+            Artifact.new(
+                name=name,
+                spec=ArtifactSpec(
+                    executionRef=ArtifactExecutionReference(
+                        id=execution.metadata.id,
+                        name=execution.metadata.name,
+                    ),
+                    workItemRef=ArtifactWorkItemReference(
+                        id=work_item.metadata.id,
+                        name=work_item.metadata.name,
+                    ),
+                    type=artifact_type,
+                    mediaType=media_type,
+                    storage=ArtifactStorageMetadata(
+                        uri=f"file:///tmp/artifacts/{name}"
+                    ),
+                    sha256=checksum(content),
+                    sizeBytes=len(content),
+                    producer=ArtifactProducer(subsystem="test"),
+                ),
+            )
+        )
+        created.append(artifact)
+    return tuple(created)
+
+
+def blocking_finding(
+    issue: str = "Health endpoint is missing coverage",
+) -> ReviewFinding:
+    return ReviewFinding(
+        id="fix-health-test",
+        severity=ReviewFindingSeverity.HIGH,
+        category=ReviewFindingCategory.TESTS,
+        file="tests/test_health.py",
+        line=12,
+        issue=issue,
+        evidence="The verification report does not show endpoint coverage.",
+        suggestedFix="Add the missing test and rerun verification.",
+    )
+
+
+async def complete_review(
+    repository: SQLiteReviewRepository,
+    review: Review,
+    verdict: ReviewVerdict,
+    *,
+    blocking_findings: tuple[ReviewFinding, ...] = (),
+    missing_evidence: tuple[str, ...] = (),
+) -> Review:
+    return await repository.update_status(
+        review.metadata.id,
+        ReviewStatus(
+            observedGeneration=review.metadata.generation,
+            phase=ReviewPhase.COMPLETED,
+            verdict=verdict,
+            summary="Review completed",
+            blockingFindings=blocking_findings,
+            missingEvidence=missing_evidence,
+            completedAt=utc_now(),
+        ),
+        expected_resource_version=review.metadata.resource_version,
+    )
+
+
+async def fail_review(
+    repository: SQLiteReviewRepository,
+    review: Review,
+) -> Review:
+    return await repository.update_status(
+        review.metadata.id,
+        ReviewStatus(
+            observedGeneration=review.metadata.generation,
+            phase=ReviewPhase.FAILED,
+            failureMessage="Reviewer provider failed",
+        ),
+        expected_resource_version=review.metadata.resource_version,
+    )
+
+
 def provider_resource() -> Provider:
     return Provider.new(
         name="ollama-local",
@@ -817,15 +1004,14 @@ def test_execution_controller_advances_only_with_evidence_and_cancels_safely(
             waiting_for_final.status.phase == ExecutionPhase.WAITING_FOR_FINAL_APPROVAL
         )
 
-        final_approval = await approval_repository.create(
-            Approval.new(
-                name="final-approval",
-                spec=approval_spec(
-                    created_execution.metadata.id,
-                    waiting_for_final,
-                    approval_type=ApprovalType.FINAL,
-                ),
-            )
+        final_approvals = await approval_repository.list_by_execution(
+            created_execution.metadata.id
+        )
+        final_approval = next(
+            approval
+            for approval in final_approvals
+            if approval.spec.approval_type == ApprovalType.FINAL
+            and approval.spec.subject_ref.kind == "Review"
         )
         await approve(approval_repository, final_approval)
 
@@ -879,6 +1065,300 @@ def test_execution_controller_advances_only_with_evidence_and_cancels_safely(
         work_item_repository.close()
         review_repository.close()
         approval_repository.close()
+
+    asyncio.run(scenario())
+
+
+def test_review_repair_workflow_approve_path_creates_exact_final_approval() -> None:
+    async def scenario() -> None:
+        harness = await review_workflow_harness()
+
+        await harness.controller.reconcile(context_for(harness.execution))
+        reviewing = await harness.executions.get(harness.execution.metadata.id)
+        reviews = await harness.reviews.list_by_execution(harness.execution.metadata.id)
+        artifacts = await harness.artifacts.list_by_work_item(
+            harness.work_item.metadata.id
+        )
+
+        assert reviewing.status.phase == ExecutionPhase.REVIEWING
+        assert condition(reviewing, "Reconciled").reason == "WaitingForReview"
+        assert len(reviews) == 1
+        assert {subject.id for subject in reviews[0].spec.subject_refs} == {
+            artifact.metadata.id for artifact in artifacts
+        }
+
+        completed_review = await complete_review(
+            harness.reviews,
+            reviews[0],
+            ReviewVerdict.APPROVE,
+        )
+
+        await harness.controller.reconcile(context_for(reviewing))
+        waiting = await harness.executions.get(harness.execution.metadata.id)
+        approvals = await harness.approvals.list_by_execution(
+            harness.execution.metadata.id
+        )
+        final_approval = approvals[0]
+
+        assert waiting.status.phase == ExecutionPhase.WAITING_FOR_FINAL_APPROVAL
+        assert condition(waiting, "Reconciled").reason == "ReviewApproved"
+        assert final_approval.spec.approval_type == ApprovalType.FINAL
+        assert final_approval.spec.subject_ref.kind == "Review"
+        assert final_approval.spec.subject_ref.id == completed_review.metadata.id
+        assert (
+            final_approval.spec.subject_ref.resource_version
+            == completed_review.metadata.resource_version
+        )
+
+        await approve(harness.approvals, final_approval)
+        await harness.controller.reconcile(context_for(waiting))
+        completed = await harness.executions.get(harness.execution.metadata.id)
+        assert completed.status.phase == ExecutionPhase.COMPLETED
+
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_review_repair_workflow_request_changes_creates_one_repair_iteration() -> None:
+    async def scenario() -> None:
+        harness = await review_workflow_harness()
+        await harness.controller.reconcile(context_for(harness.execution))
+        reviews = await harness.reviews.list_by_execution(harness.execution.metadata.id)
+        review = reviews[0]
+        await complete_review(
+            harness.reviews,
+            review,
+            ReviewVerdict.REQUEST_CHANGES,
+            blocking_findings=(blocking_finding(),),
+        )
+
+        await harness.controller.reconcile(context_for(harness.execution))
+        executing = await harness.executions.get(harness.execution.metadata.id)
+        work_items = await harness.work_items.list_by_execution(
+            harness.execution.metadata.id
+        )
+        repair_items = tuple(
+            item
+            for item in work_items
+            if item.spec.plan_work_item_id.startswith("repair-")
+        )
+
+        assert executing.status.phase == ExecutionPhase.EXECUTING
+        assert executing.status.iteration.coding == 1
+        assert executing.status.iteration.review == 1
+        assert len(repair_items) == 1
+        assert repair_items[0].spec.depends_on[0].id == harness.work_item.metadata.id
+        assert any(
+            "fix-health-test" in criterion
+            for criterion in repair_items[0].spec.acceptance_criteria
+        )
+
+        await harness.controller.reconcile(context_for(executing))
+        restarted = await harness.executions.get(harness.execution.metadata.id)
+        restart_items = await harness.work_items.list_by_execution(
+            harness.execution.metadata.id
+        )
+
+        assert restarted.status.phase == ExecutionPhase.EXECUTING
+        assert len(restart_items) == 2
+
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_review_repair_workflow_repair_success_reviews_new_artifacts() -> None:
+    async def scenario() -> None:
+        harness = await review_workflow_harness()
+        await harness.controller.reconcile(context_for(harness.execution))
+        reviews = await harness.reviews.list_by_execution(harness.execution.metadata.id)
+        review = reviews[0]
+        await complete_review(
+            harness.reviews,
+            review,
+            ReviewVerdict.REQUEST_CHANGES,
+            blocking_findings=(blocking_finding(),),
+        )
+        await harness.controller.reconcile(context_for(harness.execution))
+        repair = next(
+            item
+            for item in await harness.work_items.list_by_execution(
+                harness.execution.metadata.id
+            )
+            if item.spec.plan_work_item_id.startswith("repair-")
+        )
+
+        succeeded_repair = await succeed_work_item(harness.work_items, repair)
+        repair_artifacts = await create_review_artifacts(
+            harness.artifacts,
+            harness.execution,
+            succeeded_repair,
+            suffix="repair",
+        )
+        executing = await harness.executions.get(harness.execution.metadata.id)
+        await harness.controller.reconcile(context_for(executing))
+        verifying = await harness.executions.get(harness.execution.metadata.id)
+        await harness.controller.reconcile(context_for(verifying))
+        reviewing = await harness.executions.get(harness.execution.metadata.id)
+        await harness.controller.reconcile(context_for(reviewing))
+
+        repair_reviews = await harness.reviews.list_by_work_item(
+            succeeded_repair.metadata.id
+        )
+        assert reviewing.status.phase == ExecutionPhase.REVIEWING
+        assert len(repair_reviews) == 1
+        assert {subject.id for subject in repair_reviews[0].spec.subject_refs} == {
+            artifact.metadata.id for artifact in repair_artifacts
+        }
+
+        completed_repair_review = await complete_review(
+            harness.reviews,
+            repair_reviews[0],
+            ReviewVerdict.APPROVE,
+        )
+        reviewing = await harness.executions.get(harness.execution.metadata.id)
+        await harness.controller.reconcile(context_for(reviewing))
+        waiting = await harness.executions.get(harness.execution.metadata.id)
+        final_approval = (
+            await harness.approvals.list_by_execution(harness.execution.metadata.id)
+        )[0]
+
+        assert waiting.status.phase == ExecutionPhase.WAITING_FOR_FINAL_APPROVAL
+        assert final_approval.spec.subject_ref.id == completed_repair_review.metadata.id
+        assert (
+            final_approval.spec.subject_ref.resource_version
+            == completed_repair_review.metadata.resource_version
+        )
+
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_review_repair_workflow_enforces_repair_limit() -> None:
+    async def scenario() -> None:
+        harness = await review_workflow_harness(
+            max_review_iterations=1,
+            review_iteration=1,
+        )
+        await harness.controller.reconcile(context_for(harness.execution))
+        reviews = await harness.reviews.list_by_execution(harness.execution.metadata.id)
+        review = reviews[0]
+        await complete_review(
+            harness.reviews,
+            review,
+            ReviewVerdict.REQUEST_CHANGES,
+            blocking_findings=(blocking_finding(),),
+        )
+
+        await harness.controller.reconcile(context_for(harness.execution))
+        failed = await harness.executions.get(harness.execution.metadata.id)
+        work_items = await harness.work_items.list_by_execution(
+            harness.execution.metadata.id
+        )
+
+        assert failed.status.phase == ExecutionPhase.FAILED
+        assert condition(failed, "Reconciled").reason == "ReviewRepairLimitExceeded"
+        assert len(work_items) == 1
+
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_review_repair_workflow_failed_review_is_terminal() -> None:
+    async def scenario() -> None:
+        harness = await review_workflow_harness()
+        await harness.controller.reconcile(context_for(harness.execution))
+        reviews = await harness.reviews.list_by_execution(harness.execution.metadata.id)
+        await fail_review(harness.reviews, reviews[0])
+
+        await harness.controller.reconcile(context_for(harness.execution))
+        failed = await harness.executions.get(harness.execution.metadata.id)
+        reviews_after_failure = await harness.reviews.list_by_execution(
+            harness.execution.metadata.id
+        )
+
+        assert failed.status.phase == ExecutionPhase.FAILED
+        assert condition(failed, "Reconciled").reason == "ReviewFailed"
+        assert len(reviews_after_failure) == 1
+
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_review_repair_workflow_needs_human_decision_pauses_for_approval() -> None:
+    async def scenario() -> None:
+        harness = await review_workflow_harness()
+        await harness.controller.reconcile(context_for(harness.execution))
+        reviews = await harness.reviews.list_by_execution(harness.execution.metadata.id)
+        review = reviews[0]
+        await complete_review(
+            harness.reviews,
+            review,
+            ReviewVerdict.NEEDS_HUMAN_DECISION,
+        )
+
+        await harness.controller.reconcile(context_for(harness.execution))
+        waiting = await harness.executions.get(harness.execution.metadata.id)
+        approvals = await harness.approvals.list_by_execution(
+            harness.execution.metadata.id
+        )
+
+        assert waiting.status.phase == ExecutionPhase.WAITING_FOR_FINAL_APPROVAL
+        assert condition(waiting, "Reconciled").reason == "ReviewNeedsHumanDecision"
+        assert len(approvals) == 1
+        assert approvals[0].status.phase == ApprovalPhase.PENDING
+
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_review_repair_workflow_ignores_stale_final_approval() -> None:
+    async def scenario() -> None:
+        harness = await review_workflow_harness()
+        await harness.controller.reconcile(context_for(harness.execution))
+        reviews = await harness.reviews.list_by_execution(harness.execution.metadata.id)
+        review = reviews[0]
+        stale_approval = await harness.approvals.create(
+            Approval.new(
+                name="stale-final-approval",
+                spec=approval_spec(
+                    harness.execution.metadata.id,
+                    review,
+                    approval_type=ApprovalType.FINAL,
+                ),
+            )
+        )
+        await approve(harness.approvals, stale_approval)
+        await complete_review(harness.reviews, review, ReviewVerdict.APPROVE)
+
+        await harness.controller.reconcile(context_for(harness.execution))
+        waiting = await harness.executions.get(harness.execution.metadata.id)
+        await harness.controller.reconcile(context_for(waiting))
+        still_waiting = await harness.executions.get(harness.execution.metadata.id)
+        approvals = await harness.approvals.list_by_execution(
+            harness.execution.metadata.id
+        )
+        current_approval = next(
+            approval
+            for approval in approvals
+            if approval.status.phase == ApprovalPhase.PENDING
+        )
+
+        assert still_waiting.status.phase == ExecutionPhase.WAITING_FOR_FINAL_APPROVAL
+        assert current_approval.spec.subject_ref.resource_version == 2
+
+        await approve(harness.approvals, current_approval)
+        await harness.controller.reconcile(context_for(still_waiting))
+        completed = await harness.executions.get(harness.execution.metadata.id)
+
+        assert completed.status.phase == ExecutionPhase.COMPLETED
+
+        harness.close()
 
     asyncio.run(scenario())
 

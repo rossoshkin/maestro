@@ -24,9 +24,12 @@ from maestro.domain.agents import (
 from maestro.domain.approvals import (
     Approval,
     ApprovalDecision,
+    ApprovalExecutionReference,
     ApprovalPhase,
     ApprovalRepository,
+    ApprovalSpec,
     ApprovalStatus,
+    ApprovalSubjectReference,
     ApprovalType,
 )
 from maestro.domain.artifacts import (
@@ -34,6 +37,7 @@ from maestro.domain.artifacts import (
     ArtifactRepository,
     ArtifactStatus,
     ArtifactStorage,
+    ArtifactType,
     artifact_status_from_integrity,
 )
 from maestro.domain.events import EventPublisher
@@ -41,6 +45,7 @@ from maestro.domain.exceptions import ResourceNameNotFoundError
 from maestro.domain.executions import (
     TERMINAL_EXECUTION_PHASES,
     Execution,
+    ExecutionIterationStatus,
     ExecutionPhase,
     ExecutionRepository,
     ExecutionStatus,
@@ -78,10 +83,15 @@ from maestro.domain.resources import (
 )
 from maestro.domain.reviews import (
     Review,
+    ReviewArtifactReference,
+    ReviewExecutionReference,
     ReviewPhase,
     ReviewRepository,
+    ReviewRoleReference,
+    ReviewSpec,
     ReviewStatus,
     ReviewVerdict,
+    ReviewWorkItemReference,
 )
 from maestro.domain.work_items import (
     WorkItem,
@@ -841,6 +851,7 @@ class ExecutionController:
         plan_repository: PlanRepository | None = None,
         workspace_repository: WorkspaceRepository | None = None,
         work_item_repository: WorkItemRepository | None = None,
+        artifact_repository: ArtifactRepository | None = None,
         review_repository: ReviewRepository | None = None,
         approval_repository: ApprovalRepository | None = None,
         event_publisher: EventPublisher | None = None,
@@ -849,6 +860,7 @@ class ExecutionController:
         self._plan_repository = plan_repository
         self._workspace_repository = workspace_repository
         self._work_item_repository = work_item_repository
+        self._artifact_repository = artifact_repository
         self._review_repository = review_repository
         self._approval_repository = approval_repository
         self._writer = StatusWriter(
@@ -1038,31 +1050,78 @@ class ExecutionController:
         if self._review_repository is None:
             await self._mark_waiting(execution, "WaitingForReview")
             return
+        if self._work_item_repository is None:
+            await self._mark_waiting(execution, "WaitingForReviewWorkItem")
+            return
+
+        work_items = await self._work_item_repository.list_by_execution(
+            execution.metadata.id
+        )
+        target_work_item = _latest_succeeded_work_item(work_items)
+        if target_work_item is None:
+            await self._mark_waiting(execution, "WaitingForReviewWorkItem")
+            return
+
         reviews = await self._review_repository.list_by_execution(execution.metadata.id)
+        target_reviews = tuple(
+            review
+            for review in reviews
+            if review.spec.work_item_ref.id == target_work_item.metadata.id
+        )
         completed = tuple(
-            review for review in reviews if review.status.phase == ReviewPhase.COMPLETED
+            review
+            for review in target_reviews
+            if review.status.phase == ReviewPhase.COMPLETED
         )
         if not completed:
+            if any(
+                review.status.phase == ReviewPhase.FAILED for review in target_reviews
+            ):
+                await self._transition_execution(
+                    execution,
+                    ExecutionPhase.FAILED,
+                    current_step="review",
+                    completed_at=utc_now(),
+                    condition_reason="ReviewFailed",
+                )
+                return
+            review = await self._ensure_review(
+                execution,
+                target_work_item,
+                target_reviews,
+            )
+            if review is None:
+                return
             await self._mark_waiting(execution, "WaitingForReview")
             return
-        latest = completed[-1]
-        if latest.status.verdict in {
-            ReviewVerdict.APPROVE,
-            ReviewVerdict.NEEDS_HUMAN_DECISION,
-        }:
+        latest = _latest_completed_review(completed)
+        if latest.status.verdict == ReviewVerdict.APPROVE:
+            approval = await self._ensure_final_approval(execution, latest)
+            if approval is None:
+                return
             await self._transition_execution(
                 execution,
                 ExecutionPhase.WAITING_FOR_FINAL_APPROVAL,
                 current_step="final-approval",
-                condition_reason="ReviewCompleted",
+                condition_reason="ReviewApproved",
+            )
+            return
+        if latest.status.verdict == ReviewVerdict.NEEDS_HUMAN_DECISION:
+            approval = await self._ensure_final_approval(execution, latest)
+            if approval is None:
+                return
+            await self._transition_execution(
+                execution,
+                ExecutionPhase.WAITING_FOR_FINAL_APPROVAL,
+                current_step="final-approval",
+                condition_reason="ReviewNeedsHumanDecision",
             )
             return
         if latest.status.verdict == ReviewVerdict.REQUEST_CHANGES:
-            await self._transition_execution(
+            await self._route_review_request_changes(
                 execution,
-                ExecutionPhase.EXECUTING,
-                current_step="execute-work-items",
-                condition_reason="ReviewRequestedChanges",
+                target_work_item,
+                latest,
             )
             return
         await self._transition_execution(
@@ -1073,10 +1132,276 @@ class ExecutionController:
             condition_reason="ReviewUnableToReview",
         )
 
+    async def _ensure_review(
+        self,
+        execution: Execution,
+        work_item: WorkItem,
+        existing_reviews: tuple[Review, ...],
+    ) -> Review | None:
+        assert self._review_repository is not None
+        active_review = _active_review(existing_reviews)
+        if active_review is not None:
+            return active_review
+
+        subject_refs = await self._review_subject_refs(execution, work_item)
+        if not subject_refs:
+            await self._mark_waiting(execution, "WaitingForReviewEvidence")
+            return None
+
+        review = Review.new(
+            name=f"review-{work_item.metadata.id.hex[:12]}-{len(existing_reviews) + 1}",
+            namespace=execution.metadata.namespace,
+            spec=ReviewSpec(
+                executionRef=ReviewExecutionReference(
+                    id=execution.metadata.id,
+                    name=execution.metadata.name,
+                ),
+                workItemRef=ReviewWorkItemReference(
+                    id=work_item.metadata.id,
+                    name=work_item.metadata.name,
+                ),
+                reviewerRoleRef=ReviewRoleReference(
+                    name="reviewer",
+                    version="v1alpha1",
+                ),
+                subjectRefs=subject_refs,
+                acceptanceCriteria=_review_acceptance_criteria(execution, work_item),
+            ),
+        )
+        return await self._review_repository.create(review)
+
+    async def _review_subject_refs(
+        self,
+        execution: Execution,
+        work_item: WorkItem,
+    ) -> tuple[ReviewArtifactReference, ...]:
+        if self._artifact_repository is None:
+            return ()
+
+        artifacts = await self._artifact_repository.list_by_work_item(
+            work_item.metadata.id
+        )
+        review_artifacts = tuple(
+            artifact
+            for artifact in artifacts
+            if artifact.spec.execution_ref.id == execution.metadata.id
+            and artifact.spec.artifact_type
+            in {
+                ArtifactType.GIT_DIFF,
+                ArtifactType.SUMMARY,
+                ArtifactType.VERIFICATION_REPORT,
+            }
+        )
+        observed_types = {artifact.spec.artifact_type for artifact in review_artifacts}
+        if not {
+            ArtifactType.GIT_DIFF,
+            ArtifactType.VERIFICATION_REPORT,
+        }.issubset(observed_types):
+            return ()
+
+        return tuple(
+            ReviewArtifactReference(
+                id=artifact.metadata.id,
+                name=artifact.metadata.name,
+                resourceVersion=artifact.metadata.resource_version,
+            )
+            for artifact in sorted(
+                review_artifacts,
+                key=lambda item: (item.spec.artifact_type, item.metadata.name),
+            )
+        )
+
+    async def _route_review_request_changes(
+        self,
+        execution: Execution,
+        reviewed_work_item: WorkItem,
+        review: Review,
+    ) -> None:
+        if (
+            execution.status.iteration.review
+            >= execution.spec.limits.max_review_iterations
+        ):
+            await self._transition_execution(
+                execution,
+                ExecutionPhase.FAILED,
+                current_step="review",
+                completed_at=utc_now(),
+                condition_reason="ReviewRepairLimitExceeded",
+            )
+            return
+        if self._work_item_repository is None:
+            await self._mark_waiting(execution, "WaitingForRepairWorkItem")
+            return
+
+        repair_work_item = await self._ensure_repair_work_item(
+            execution,
+            reviewed_work_item,
+            review,
+        )
+        work_items = await self._work_item_repository.list_by_execution(
+            execution.metadata.id
+        )
+        active_work_items = _merge_work_items(work_items, repair_work_item)
+        next_iteration = execution.status.iteration.model_copy(
+            update={
+                "coding": execution.status.iteration.coding + 1,
+                "review": execution.status.iteration.review + 1,
+            }
+        )
+        await self._transition_execution(
+            execution,
+            ExecutionPhase.EXECUTING,
+            current_step="execute-work-items",
+            active_work_item_refs=tuple(
+                _ref(work_item) for work_item in active_work_items
+            ),
+            iteration=next_iteration,
+            condition_reason="ReviewRequestedChanges",
+        )
+
+    async def _ensure_repair_work_item(
+        self,
+        execution: Execution,
+        source_work_item: WorkItem,
+        review: Review,
+    ) -> WorkItem:
+        assert self._work_item_repository is not None
+        plan_work_item_id = f"repair-{review.metadata.id.hex[:12]}"
+        try:
+            return await self._work_item_repository.get_by_plan_work_item_id(
+                source_work_item.spec.plan_ref.id,
+                plan_work_item_id,
+            )
+        except ResourceNameNotFoundError:
+            pass
+
+        findings = tuple(review.status.blocking_findings)
+        finding_summaries = tuple(
+            f"Resolve review finding {finding.id}: {finding.issue}"
+            for finding in findings
+        )
+        objective_findings = "; ".join(
+            f"{finding.id}: {finding.issue}" for finding in findings
+        )
+        objective = (
+            f"Repair requested changes from review {review.metadata.name}: "
+            f"{objective_findings}"
+        )
+        repair_spec = WorkItemSpec(
+            executionRef=WorkItemExecutionReference(
+                id=execution.metadata.id,
+                name=execution.metadata.name,
+            ),
+            planRef=source_work_item.spec.plan_ref,
+            planWorkItemId=plan_work_item_id,
+            roleRef=source_work_item.spec.role_ref,
+            repositoryRef=source_work_item.spec.repository_ref,
+            workspaceRef=source_work_item.spec.workspace_ref,
+            objective=objective,
+            contextRefs=(
+                *source_work_item.spec.context_refs,
+                _ref(review),
+                _ref(source_work_item),
+            ),
+            constraints=(
+                *source_work_item.spec.constraints,
+                (
+                    "Repair only the blocking review findings unless a verification "
+                    "fix requires adjacent changes."
+                ),
+            ),
+            acceptanceCriteria=(
+                *source_work_item.spec.acceptance_criteria,
+                *finding_summaries,
+            ),
+            verification=source_work_item.spec.verification,
+            dependsOn=(
+                WorkItemDependencyReference(
+                    id=source_work_item.metadata.id,
+                    name=source_work_item.metadata.name,
+                ),
+            ),
+            requestedCapabilities=source_work_item.spec.requested_capabilities,
+            retryPolicy=source_work_item.spec.retry_policy,
+        )
+        return await self._work_item_repository.create(
+            WorkItem.new(
+                name=plan_work_item_id,
+                namespace=execution.metadata.namespace,
+                spec=repair_spec,
+            )
+        )
+
+    async def _ensure_final_approval(
+        self,
+        execution: Execution,
+        review: Review,
+    ) -> Approval | None:
+        if self._approval_repository is None:
+            await self._mark_waiting(execution, "WaitingForFinalApproval")
+            return None
+
+        existing = await self._approval_repository.list_by_subject(
+            review.kind,
+            review.metadata.id,
+        )
+        for approval in existing:
+            if (
+                approval.spec.approval_type == ApprovalType.FINAL
+                and approval.spec.subject_ref.resource_version
+                == review.metadata.resource_version
+            ):
+                return approval
+
+        return await self._approval_repository.create(
+            Approval.new(
+                name=(
+                    f"final-approval-{review.metadata.id.hex[:10]}"
+                    f"-v{review.metadata.resource_version}"
+                ),
+                namespace=execution.metadata.namespace,
+                spec=ApprovalSpec(
+                    executionRef=ApprovalExecutionReference(
+                        id=execution.metadata.id,
+                        name=execution.metadata.name,
+                    ),
+                    subjectRef=ApprovalSubjectReference(
+                        kind=review.kind,
+                        id=review.metadata.id,
+                        name=review.metadata.name,
+                        resourceVersion=review.metadata.resource_version,
+                    ),
+                    type=ApprovalType.FINAL,
+                ),
+            )
+        )
+
+    async def _current_final_review(self, execution: Execution) -> Review | None:
+        if self._review_repository is None:
+            return None
+        reviews = await self._review_repository.list_by_execution(execution.metadata.id)
+        completed = tuple(
+            review
+            for review in reviews
+            if review.status.phase == ReviewPhase.COMPLETED
+            and review.status.verdict
+            in {
+                ReviewVerdict.APPROVE,
+                ReviewVerdict.NEEDS_HUMAN_DECISION,
+            }
+        )
+        if not completed:
+            return None
+        return _latest_completed_review(completed)
+
     async def _reconcile_final_approval(self, execution: Execution) -> None:
         if self._approval_repository is None:
             await self._mark_waiting(execution, "WaitingForFinalApproval")
             return
+
+        current_review = await self._current_final_review(execution)
+        if current_review is not None:
+            await self._ensure_final_approval(execution, current_review)
         approvals = await self._approval_repository.list_by_execution(
             execution.metadata.id
         )
@@ -1084,6 +1409,10 @@ class ExecutionController:
             approval
             for approval in approvals
             if approval.spec.approval_type == ApprovalType.FINAL
+            and (
+                current_review is None
+                or _approval_targets_review(approval, current_review)
+            )
         )
         if any(
             approval.status.phase == ApprovalPhase.APPROVED
@@ -1135,6 +1464,7 @@ class ExecutionController:
         approved_plan_ref: ResourceReference | None | _Unset = _UNSET,
         active_work_item_refs: tuple[ResourceReference, ...] | _Unset = _UNSET,
         workspace_refs: tuple[ResourceReference, ...] | _Unset = _UNSET,
+        iteration: ExecutionIterationStatus | _Unset = _UNSET,
         started_at: datetime | None | _Unset = _UNSET,
         completed_at: datetime | None | _Unset = _UNSET,
     ) -> None:
@@ -1150,6 +1480,8 @@ class ExecutionController:
                 updates["active_work_item_refs"] = active_work_item_refs
             if workspace_refs is not _UNSET:
                 updates["workspace_refs"] = workspace_refs
+            if iteration is not _UNSET:
+                updates["iteration"] = iteration
             if started_at is not _UNSET:
                 updates["started_at"] = started_at
             if completed_at is not _UNSET:
@@ -1265,6 +1597,75 @@ def _approval_for_resource_version(
 
 def _last_approval_decision(approval: Approval) -> ApprovalDecision:
     return approval.status.decisions[-1]
+
+
+def _latest_succeeded_work_item(work_items: tuple[WorkItem, ...]) -> WorkItem | None:
+    succeeded = tuple(
+        work_item
+        for work_item in work_items
+        if work_item.status.phase == WorkItemPhase.SUCCEEDED
+    )
+    if not succeeded:
+        return None
+    return max(
+        succeeded,
+        key=lambda work_item: (
+            work_item.status.completed_at or work_item.metadata.updated_at,
+            work_item.metadata.name,
+        ),
+    )
+
+
+def _latest_completed_review(reviews: tuple[Review, ...]) -> Review:
+    return max(
+        reviews,
+        key=lambda review: (
+            review.status.completed_at or review.metadata.updated_at,
+            review.metadata.name,
+        ),
+    )
+
+
+def _active_review(reviews: tuple[Review, ...]) -> Review | None:
+    active_reviews = tuple(
+        review
+        for review in reviews
+        if review.status.phase
+        in {ReviewPhase.PENDING, ReviewPhase.SCHEDULED, ReviewPhase.RUNNING}
+    )
+    if not active_reviews:
+        return None
+    return max(active_reviews, key=lambda review: review.metadata.updated_at)
+
+
+def _review_acceptance_criteria(
+    execution: Execution,
+    work_item: WorkItem,
+) -> tuple[str, ...]:
+    criteria = (
+        *work_item.spec.acceptance_criteria,
+        *execution.spec.goal.acceptance_criteria,
+    )
+    deduplicated = tuple(dict.fromkeys(criteria))
+    return deduplicated or (execution.spec.goal.summary,)
+
+
+def _merge_work_items(
+    work_items: tuple[WorkItem, ...],
+    work_item: WorkItem,
+) -> tuple[WorkItem, ...]:
+    by_id = {item.metadata.id: item for item in work_items}
+    by_id[work_item.metadata.id] = work_item
+    return tuple(by_id.values())
+
+
+def _approval_targets_review(approval: Approval, review: Review) -> bool:
+    return (
+        approval.spec.subject_ref.kind == review.kind
+        and approval.spec.subject_ref.id == review.metadata.id
+        and approval.spec.subject_ref.resource_version
+        == review.metadata.resource_version
+    )
 
 
 def _ref(resource: BaseResource[Any, Any]) -> ResourceReference:

@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 23 — Review and Repair Workflow
+Current milestone: Milestone 24 — REST API
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -1818,6 +1818,8 @@ Codex can produce structured Reviews through the generic Reviewer contract.
 
 # Milestone 23 — Review and Repair Workflow
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Connect verification, Codex review, bounded repair, and final approval.
@@ -1877,6 +1879,21 @@ Connect verification, Codex review, bounded repair, and final approval.
 ## Exit Criteria
 
 The complete coding, verification, review, repair, and final approval loop works without UI.
+
+## Completion Notes
+
+- Extended the Execution controller to create Review resources from immutable diff and verification Artifact evidence.
+- Routed completed Review verdicts through Approve, RequestChanges, NeedsHumanDecision and terminal failure paths.
+- Added bounded repair WorkItem creation with iteration counters and idempotent restart behavior.
+- Enforced max review repair iterations before creating additional repair work.
+- Created final Approval resources against exact completed Review resource versions.
+- Filtered final approval reconciliation to the latest completed Review version so stale approvals cannot complete a repaired execution.
+- Added controller tests for approve routing, request-changes repair creation, repair success, repair exhaustion, NeedsHumanDecision, stale approval filtering and restart during repair.
+- Verification completed:
+  - `uv run pytest tests/application/test_resource_controllers.py`
+  - `uv run ruff check src/maestro/application/resource_controllers.py tests/application/test_resource_controllers.py`
+  - `uv run ruff format --check src/maestro/application/resource_controllers.py tests/application/test_resource_controllers.py`
+  - `uv run mypy src/maestro/application/resource_controllers.py`
 
 ---
 

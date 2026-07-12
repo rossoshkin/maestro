@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 14 — Controller Framework
+Current milestone: Milestone 15 — Resource Controllers
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -1103,6 +1103,8 @@ Approvals and Reviews are fully modeled and persisted.
 
 # Milestone 14 — Controller Framework
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement the generic reconciliation framework used by Maestro controllers.
@@ -1161,6 +1163,21 @@ Implement the generic reconciliation framework used by Maestro controllers.
 ## Exit Criteria
 
 Maestro can run deterministic, restart-safe controllers.
+
+## Completion Notes
+
+- Added a generic `Controller` protocol, `ReconciliationContext`, `ReconcileResult` and `ReconcileRun` outcome model.
+- Added `ControllerRegistry` with deterministic listing and duplicate-kind protection.
+- Added a deduplicating FIFO `ReconcileQueue` and `ControllerRuntime` with start/stop lifecycle, retry handling and restart recovery for unfinished resources.
+- Added `RetryPolicy` for finite controller retries and optimistic-concurrency retry bounds.
+- Added `StatusWriter` that reloads resources on stale `resourceVersion`, writes status through repositories and preserves generation semantics.
+- Added Condition helpers for `observedGeneration`, single-condition replacement and stable `lastTransitionTime` when condition status does not change.
+- Added deterministic phase-transition Event emission through the Event publisher boundary.
+- Added framework tests for idempotency, duplicate reconciliation, stale-version retry, restart recovery, status ownership, Event emission, runtime failure evidence and lifecycle behavior.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run mypy src`
 
 ---
 

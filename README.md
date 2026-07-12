@@ -6,9 +6,9 @@ Maestro is a local-first execution orchestration platform for coordinating speci
 
 ## Run Maestro Locally
 
-The current bootstrap milestone provides the local API process, health checks,
-configuration loading, structured logging, and the `maestro` CLI. Domain
-orchestration resources begin in the next milestone.
+Maestro now includes the local MVP control plane: SQLite persistence, immutable
+Events and Artifacts, resource controllers, Planner/Coding/Reviewer runtimes,
+REST API, and the browser UI.
 
 ### 1. Install `uv`
 
@@ -24,7 +24,21 @@ Confirm it is available:
 uv --version
 ```
 
-### 2. Install Project Dependencies
+### 2. Prepare Local Providers
+
+For the MVP local workflow, run Ollama on localhost and make sure the Codex CLI
+is configured:
+
+```bash
+export OLLAMA_HOST=http://127.0.0.1:11434
+ollama list
+codex --version
+```
+
+The deterministic MVP test harness does not call external models, but the real
+local runtime expects Ollama and Codex provider configuration.
+
+### 3. Install Project Dependencies
 
 From the repository root:
 
@@ -35,7 +49,7 @@ uv sync
 This creates a local `.venv/` and installs Maestro with its runtime and
 development dependencies.
 
-### 3. Check the CLI
+### 4. Check the CLI
 
 ```bash
 uv run maestro --help
@@ -43,12 +57,12 @@ uv run maestro --help
 
 You should see the `serve` command listed.
 
-### 4. Start Maestro
+### 5. Start Maestro
 
 Use the CLI:
 
 ```bash
-uv run maestro serve
+OLLAMA_HOST=http://127.0.0.1:11434 uv run maestro serve
 ```
 
 By default Maestro binds to `127.0.0.1:7860`.
@@ -65,7 +79,7 @@ The API can also be started directly with Uvicorn:
 uv run uvicorn maestro.presentation.api:app --host 127.0.0.1 --port 7860
 ```
 
-### 5. Verify Health
+### 6. Verify Health
 
 In another terminal:
 
@@ -80,7 +94,33 @@ Both endpoints should return:
 {"status":"ok"}
 ```
 
-### 6. Stop Maestro
+### 7. Open the UI
+
+Open:
+
+```text
+http://127.0.0.1:7860/ui
+```
+
+The UI shows Projects, Executions, Plans, Work Items, Role Invocations,
+Artifacts, Reviews, Approvals, and the Event timeline. It reads and acts through
+the REST API; orchestration remains in application controllers and runtimes.
+
+### 8. Run the MVP Demo Harness
+
+The end-to-end MVP harness creates a fixture Git repository, persists an
+Execution, generates and approves a Plan, prepares an isolated Workspace, runs
+Coding tools, verifies with pytest, performs a Reviewer-requested repair,
+survives an application restart, and reaches Completed:
+
+```bash
+uv run pytest tests/e2e/test_mvp_vertical_slice.py
+```
+
+More demo notes are in
+[MVP_DEMO.md](docs/development/MVP_DEMO.md).
+
+### 9. Stop Maestro
 
 Press `Ctrl-C` in the terminal running the server.
 

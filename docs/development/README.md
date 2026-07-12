@@ -23,6 +23,8 @@ Read these documents after `docs/README.md` and before writing any production co
 13. UI_GUIDELINES.md
 14. GIT_WORKFLOW.md
 15. RELEASE_PROCESS.md
+16. MVP_DEMO.md
+17. MVP_RELEASE_NOTES.md
 
 ## Documentation precedence
 

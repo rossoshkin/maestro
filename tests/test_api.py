@@ -119,6 +119,25 @@ def test_readiness_endpoint_returns_ok(tmp_path: Path) -> None:
     assert response.json() == {"status": "ok"}
 
 
+def test_api_context_sqlite_repositories_work_across_fastapi_threads(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        settings = api_settings(tmp_path)
+        context = await asyncio.to_thread(create_api_context, settings)
+        try:
+            created = await context.projects.create(
+                Project.new(name="tour-manager", spec=project_spec())
+            )
+            projects = await context.projects.list()
+
+            assert projects[0].metadata.id == created.metadata.id
+        finally:
+            context.close()
+
+    asyncio.run(scenario())
+
+
 def test_project_and_execution_endpoints_preserve_resource_shape(
     tmp_path: Path,
 ) -> None:

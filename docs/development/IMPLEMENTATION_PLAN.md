@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 26 — End-to-End MVP
+Current milestone: MVP complete — ready for v0.1.0 local release preparation
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -2079,6 +2079,8 @@ The complete MVP workflow can be operated from a browser.
 
 # Milestone 26 — End-to-End MVP
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Validate Maestro's complete local-first vertical workflow.
@@ -2109,6 +2111,8 @@ Requirements:
 - Add README instructions
 - Do not add a database
 - Do not add authentication
+```
+
 ## Deliverables
 
 - end-to-end test harness
@@ -2173,3 +2177,29 @@ Requirements:
 ## Exit Criteria
 
 Maestro MVP is complete and ready for a `v0.1.0` local release.
+
+## Completion Notes
+
+- Added `tests/e2e/test_mvp_vertical_slice.py`, an end-to-end MVP harness that
+  uses real SQLite persistence, Artifact storage, resource controllers, local Git
+  worktrees, Coding tools, independent verification, Reviewer runtime packaging,
+  restart recovery, repair routing and final approval.
+- Added `tests/fixtures/fastapi_health_app` as the fixture source repository for
+  the FastAPI health endpoint demo.
+- Added a SQLite/FastAPI thread-safety regression test for API contexts created
+  on one thread and used on another.
+- Updated all SQLite repository adapters to allow FastAPI's sync dependency
+  thread and async route thread to share the same per-process connection safely.
+- Added `docs/development/MVP_DEMO.md` with demo steps and required failure
+  scenario coverage.
+- Added `docs/development/MVP_RELEASE_NOTES.md` for the v0.1.0 local MVP.
+- Updated `docs/development/ARCHITECTURE_CHECKLIST.md` with final MVP evidence.
+- Updated the root `README.md` with the current step-by-step local run guide.
+- Verification completed:
+  - `uv run pytest tests/e2e/test_mvp_vertical_slice.py`
+  - `uv run pytest tests/test_api.py::test_api_context_sqlite_repositories_work_across_fastapi_threads`
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run ruff format --check .`
+  - `uv run mypy src`
+  - `uv run pre-commit run --all-files`

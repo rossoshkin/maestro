@@ -29,7 +29,10 @@ class SQLiteEventStore(EventStore):
         self._database_path = database_path
         if database_path != ":memory:":
             Path(database_path).parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(str(database_path))
+        self._connection = sqlite3.connect(
+            str(database_path),
+            check_same_thread=False,
+        )
         self._connection.row_factory = sqlite3.Row
         self._create_schema()
 

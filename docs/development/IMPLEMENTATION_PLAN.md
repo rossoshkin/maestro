@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 17 — Ollama Provider
+Current milestone: Milestone 18 — Planner Role Runtime
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -1346,6 +1346,8 @@ Ready Work Items can be assigned to eligible local Agents deterministically.
 
 # Milestone 17 — Ollama Provider
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement the initial local model Provider for Planner and Coding Roles.
@@ -1400,6 +1402,20 @@ Implement the initial local model Provider for Planner and Coding Roles.
 ## Exit Criteria
 
 Local Ollama models can be invoked through the generic Provider interface.
+
+## Completion Notes
+
+- Added `OllamaProvider` in `maestro.infrastructure.providers.ollama`.
+- Kept Ollama-specific HTTP payloads and endpoint handling behind the generic `ModelProvider` interface.
+- Implemented `/api/tags` health/model discovery with Ready, Degraded and Unavailable failure mapping.
+- Implemented structured JSON generation through `/api/chat` with schema-aware `format` payloads.
+- Implemented tool-call exchange through `/api/chat` with tool definition translation and tool-call validation.
+- Added request timeout capping and normalized Provider errors for timeout, unavailable endpoint, invalid request, missing model, malformed structured output and invalid tool calls.
+- Added infrastructure tests using a fake Ollama transport; no live Ollama daemon is required.
+- Verification completed:
+  - `env UV_CACHE_DIR=.uv-cache uv run pytest`
+  - `env UV_CACHE_DIR=.uv-cache uv run ruff check .`
+  - `env UV_CACHE_DIR=.uv-cache uv run mypy src`
 
 ---
 

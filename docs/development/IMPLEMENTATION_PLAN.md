@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 12 — Artifact and Event Resources
+Current milestone: Milestone 13 — Approval and Review Resources
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -930,6 +930,8 @@ A safe local Workspace can be created, used, inspected, and cleaned.
 
 # Milestone 12 — Artifact and Event Resources
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement immutable Artifacts and Events.
@@ -996,6 +998,21 @@ Implement immutable Artifacts and Events.
 ## Exit Criteria
 
 Maestro can persist evidence and audit history reliably.
+
+## Completion Notes
+
+- Added immutable `Artifact` resources with Execution ownership, required provenance, storage metadata, SHA-256 validation, source references and integrity phases.
+- Added Artifact integrity status helpers that mark content as `Available`, `Corrupt` or `Missing` from storage evidence.
+- Added SQLite Artifact persistence with immutable spec updates, status updates, list-by-Execution and list-by-WorkItem support.
+- Added local filesystem Artifact storage with path containment, checksum calculation, readback, missing-content detection and overwrite protection.
+- Added `ArtifactService` to write bytes, persist immutable metadata and refresh integrity status.
+- Added immutable `Event` resources, `EventDraft`, query filters, publisher and append-only Event store contracts.
+- Added SQLite Event store with per-Execution sequence numbering, correlation queries and idempotent duplicate delivery handling.
+- Added domain, persistence, storage and application tests for Artifact integrity, immutability, Event ordering, duplicate delivery, provenance and restart behavior.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run mypy src`
 
 ---
 

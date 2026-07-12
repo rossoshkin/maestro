@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 22 — Codex Reviewer Provider
+Current milestone: Milestone 23 — Review and Repair Workflow
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -1739,6 +1739,8 @@ Maestro independently determines whether implementation verification passed.
 
 # Milestone 22 — Codex Reviewer Provider
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement Codex as the initial Reviewer Provider.
@@ -1795,6 +1797,22 @@ Implement Codex as the initial Reviewer Provider.
 ## Exit Criteria
 
 Codex can produce structured Reviews through the generic Reviewer contract.
+
+## Completion Notes
+
+- Added a generic Reviewer runtime that packages immutable Review subject Artifacts, builds a read-only Reviewer prompt and validates structured Review output.
+- Persisted Reviewer prompt, Provider response and structured Review Artifacts with WorkItem and subject Artifact provenance.
+- Completed Review resources with structured verdicts, blocking/non-blocking findings and missing-evidence details, while preserving domain verdict validation.
+- Returned `UnableToReview` without invoking the Provider when exact Artifact evidence is missing, has the wrong resourceVersion or cannot be read.
+- Normalized Provider/Codex failures into failed Review status with stable failure messages.
+- Added a Codex Provider adapter in infrastructure using `codex exec` non-interactively with `--sandbox read-only`, `--ask-for-approval never`, schema-constrained output and injected runners for tests.
+- Kept provider-specific Codex invocation out of domain and application Review logic.
+- Added tests for approve reviews, request-changes reviews, malformed output, timeout normalization, missing Artifacts, read-only prompt packaging and Codex read-only CLI invocation.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run ruff format --check .`
+  - `uv run mypy src`
 
 ---
 

@@ -2,7 +2,7 @@
 
 Status: Living document
 
-Current milestone: Milestone 20 — Coding Role Runtime
+Current milestone: Milestone 21 — Verification Controller
 
 ## Milestone 0 — Repository Bootstrap
 
@@ -1576,6 +1576,8 @@ Coding Agents have a safe, auditable local tool environment.
 
 # Milestone 20 — Coding Role Runtime
 
+Status: Complete on 2026-07-12.
+
 ## Goal
 
 Implement Coding Role execution through Ollama and the safe tool runtime.
@@ -1636,6 +1638,22 @@ Implement Coding Role execution through Ollama and the safe tool runtime.
 ## Exit Criteria
 
 One Coding Work Item can be executed safely and produce inspectable Artifacts.
+
+## Completion Notes
+
+- Added the Coding Role runtime with prompt construction, provider-independent input context and structured output validation.
+- Implemented a bounded provider tool loop that exposes only tool schemas admitted by granted Capabilities and executes tool calls through the safe Coding tool runtime.
+- Enforced maximum tool steps before execution and maximum wall-clock duration before and after provider/tool work.
+- Persisted Coding RoleInvocation records with runtime limits, granted Capabilities, provider/model status and terminal failure details.
+- Persisted Coding prompt, provider response, tool-result, summary and Git diff Artifacts with WorkItem and RoleInvocation provenance.
+- Collected changed files independently from Workspace Git status and never marked WorkItems succeeded from model output alone; completed Coding work advances to verification.
+- Added tests for file creation, endpoint editing, admitted tool schemas, max-step enforcement, invalid and malformed output, blocked output, diff Artifacts, Workspace isolation and duration limits.
+- Verification completed:
+  - `uv run pytest`
+  - `uv run ruff check .`
+  - `uv run ruff format --check .`
+  - `uv run mypy src`
+  - `uv run pre-commit run --all-files`
 
 ---
 

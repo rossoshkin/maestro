@@ -198,11 +198,22 @@ class CodingToolRegistry:
 
         return tuple(self._definitions[name] for name in sorted(self._definitions))
 
-    def provider_tool_definitions(self) -> tuple[ProviderToolDefinition, ...]:
+    def provider_tool_definitions(
+        self,
+        *,
+        granted_capabilities: tuple[CapabilityName, ...] | None = None,
+    ) -> tuple[ProviderToolDefinition, ...]:
         """Return provider tool definitions."""
 
+        definitions = self.list()
+        if granted_capabilities is not None:
+            definitions = tuple(
+                definition
+                for definition in definitions
+                if _definition_is_admitted(definition, granted_capabilities)
+            )
         return tuple(
-            definition.provider_tool_definition() for definition in self.list()
+            definition.provider_tool_definition() for definition in definitions
         )
 
 
@@ -546,6 +557,23 @@ def default_tool_definitions() -> tuple[ToolDefinition, ...]:
             input_model=GitDiffInput,
             required_capabilities=("git.diff",),
         ),
+    )
+
+
+def _definition_is_admitted(
+    definition: ToolDefinition,
+    granted_capabilities: tuple[CapabilityName, ...],
+) -> bool:
+    if any(
+        capability in granted_capabilities
+        for capability in definition.required_capabilities
+    ):
+        return True
+    if definition.name != "run-command":
+        return False
+    return any(
+        capability == "shell.execute" or capability.startswith("shell.execute.")
+        for capability in granted_capabilities
     )
 
 

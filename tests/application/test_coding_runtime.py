@@ -154,6 +154,43 @@ class RecordingWorkspaceProvider:
         return WorkspaceCommandResult(exitCode=0, stdout="ok\n")
 
 
+class FilesystemStatusWorkspaceProvider(RecordingWorkspaceProvider):
+    """Workspace provider that reports dirty status from a real file path."""
+
+    def __init__(self, workspace_root: Path, changed_path: str) -> None:
+        super().__init__()
+        self._workspace_root = workspace_root
+        self._changed_path = changed_path
+
+    async def collect_state(self, handle: WorkspaceHandle) -> WorkspaceState:
+        return WorkspaceState(
+            observedRevision="abc123",
+            dirty=(self._workspace_root / self._changed_path).exists(),
+        )
+
+    async def collect_diff(self, handle: WorkspaceHandle) -> WorkspaceDiff:
+        if not (self._workspace_root / self._changed_path).exists():
+            return WorkspaceDiff(text="")
+        return WorkspaceDiff(
+            text=f"diff --git a/{self._changed_path} b/{self._changed_path}\n"
+        )
+
+    async def run_command(
+        self,
+        handle: WorkspaceHandle,
+        request: WorkspaceCommandRequest,
+    ) -> WorkspaceCommandResult:
+        self.command_requests.append(request)
+        if request.command == ("git", "status", "--porcelain"):
+            if (self._workspace_root / self._changed_path).exists():
+                return WorkspaceCommandResult(
+                    exitCode=0,
+                    stdout=f"?? {self._changed_path}\n",
+                )
+            return WorkspaceCommandResult(exitCode=0, stdout="")
+        return WorkspaceCommandResult(exitCode=0, stdout="ok\n")
+
+
 class RecordingPublisher:
     """Capture runtime audit events."""
 
@@ -480,10 +517,415 @@ def test_coding_runtime_enforces_max_steps_before_executing_extra_tools(
     asyncio.run(scenario())
 
 
+def test_coding_runtime_repairs_repeated_tool_call_loop(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        repeated_list = tool_call("list-files", {"path": ".", "recursive": True})
+        model = RecordingModelProvider(
+            (
+                repeated_list,
+                repeated_list,
+                repeated_list,
+                repeated_list,
+                tool_call(
+                    "write-file",
+                    {
+                        "path": "app.py",
+                        "content": (
+                            "from fastapi import FastAPI\n\n"
+                            "app = FastAPI()\n\n"
+                            "@app.get('/health')\n"
+                            "def health():\n"
+                            "    return {'status': 'ok'}\n"
+                        ),
+                    },
+                ),
+                completed_output(
+                    summary="Created health endpoint.",
+                    changed_path="app.py",
+                ),
+            )
+        )
+        workspace_provider = RecordingWorkspaceProvider(
+            status_stdout="?? app.py\n",
+            diff="diff --git a/app.py b/app.py\n+from fastapi import FastAPI\n",
+        )
+
+        result = await harness.runtime.invoke_coding(
+            harness.work_item.metadata.id,
+            workspace=harness.workspace,
+            workspace_provider=workspace_provider,
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=model,
+            granted_capabilities=granted_capabilities(),
+        )
+
+        assert result.status == CodingOutputStatus.COMPLETED
+        assert "FastAPI" in (tmp_path / "workspace" / "app.py").read_text()
+        assert len(result.tool_artifact_refs) == 4
+        assert "repeated a tool call" in model.calls[4].messages[-1].content
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_coding_runtime_repairs_echoed_tool_result(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        model = RecordingModelProvider(
+            (
+                tool_call("run-command", {"path": "."}),
+                {
+                    "output": {
+                        "command": ("ls", "-la"),
+                        "cwd": ".",
+                        "exitCode": 0,
+                        "stdout": "README.md\n",
+                        "stderr": "",
+                        "timeoutSeconds": 30,
+                    }
+                },
+                tool_call(
+                    "write-file",
+                    {
+                        "path": "main.py",
+                        "content": (
+                            "from fastapi import FastAPI\n\n"
+                            "app = FastAPI()\n\n"
+                            "@app.get('/health')\n"
+                            "def health():\n"
+                            "    return {'status': 'ok'}\n"
+                        ),
+                    },
+                ),
+                completed_output(
+                    summary="Created FastAPI health endpoint.",
+                    changed_path="main.py",
+                ),
+            )
+        )
+        workspace_provider = FilesystemStatusWorkspaceProvider(
+            tmp_path / "workspace",
+            "main.py",
+        )
+
+        result = await harness.runtime.invoke_coding(
+            harness.work_item.metadata.id,
+            workspace=harness.workspace,
+            workspace_provider=workspace_provider,
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=model,
+            granted_capabilities=granted_capabilities(),
+            max_steps=4,
+        )
+
+        assert result.status == CodingOutputStatus.COMPLETED
+        assert "FastAPI" in (tmp_path / "workspace" / "main.py").read_text()
+        assert workspace_provider.command_requests[0].command == ("ls", "-la")
+        assert "copied a tool result" in model.calls[2].messages[-1].content
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_coding_runtime_fails_fast_for_unrecovered_tool_call_loop(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        repeated_list = tool_call("list-files", {"path": ".", "recursive": True})
+        model = RecordingModelProvider((repeated_list,) * 8)
+
+        result = await harness.runtime.invoke_coding(
+            harness.work_item.metadata.id,
+            workspace=harness.workspace,
+            workspace_provider=RecordingWorkspaceProvider(),
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=model,
+            granted_capabilities=granted_capabilities(),
+        )
+
+        invocation = (
+            await harness.role_invocations.list_by_work_item(
+                harness.work_item.metadata.id
+            )
+        )[0]
+
+        assert result.status == LiteralRuntimeStatus.STEP_LIMIT_EXCEEDED
+        assert invocation.status.phase == RoleInvocationPhase.FAILED
+        assert invocation.status.failure is not None
+        assert invocation.status.failure.reason == "CodingToolLoopStalled"
+        assert len(result.tool_artifact_refs) == 6
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_coding_runtime_rejects_completed_output_without_observed_changes(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        output = completed_output(
+            summary="No changes detected in the workspace. Try again."
+        )
+        model = RecordingModelProvider((output, output, output))
+
+        result = await harness.runtime.invoke_coding(
+            harness.work_item.metadata.id,
+            workspace=harness.workspace,
+            workspace_provider=RecordingWorkspaceProvider(),
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=model,
+            granted_capabilities=granted_capabilities(),
+        )
+
+        invocation = (
+            await harness.role_invocations.list_by_work_item(
+                harness.work_item.metadata.id
+            )
+        )[0]
+
+        assert result.status == LiteralRuntimeStatus.INVALID_OUTPUT
+        assert invocation.status.phase == RoleInvocationPhase.FAILED
+        assert invocation.status.failure is not None
+        assert invocation.status.failure.reason == "CodingOutputInvalid"
+        assert invocation.status.failure.message == (
+            "completed CodingOutput must produce observed workspace changes "
+            "for this WorkItem"
+        )
+        assert len(model.calls) == 3
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_coding_runtime_accepts_summary_only_output_with_observed_changes(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        model = RecordingModelProvider(
+            (
+                tool_call(
+                    "write-file",
+                    {
+                        "path": "app.py",
+                        "content": (
+                            "from fastapi import FastAPI\n\n"
+                            "app = FastAPI()\n\n"
+                            "@app.get('/health')\n"
+                            "def health():\n"
+                            "    return {'status': 'ok'}\n"
+                        ),
+                    },
+                ),
+                {"summary": "Created the FastAPI health endpoint."},
+            )
+        )
+        workspace_provider = RecordingWorkspaceProvider(
+            status_stdout="?? app.py\n",
+            diff="diff --git a/app.py b/app.py\n+from fastapi import FastAPI\n",
+        )
+
+        result = await harness.runtime.invoke_coding(
+            harness.work_item.metadata.id,
+            workspace=harness.workspace,
+            workspace_provider=workspace_provider,
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=model,
+            granted_capabilities=granted_capabilities(),
+        )
+
+        assert result.status == CodingOutputStatus.COMPLETED
+        assert result.output is not None
+        assert result.output.status == CodingOutputStatus.COMPLETED
+        assert result.observed_changed_files[0].path == "app.py"
+        assert "FastAPI" in (tmp_path / "workspace" / "app.py").read_text()
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_coding_runtime_rejects_summary_only_output_without_observed_changes(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        output = {"summary": "The requested change is already complete."}
+        model = RecordingModelProvider((output, output, output))
+
+        result = await harness.runtime.invoke_coding(
+            harness.work_item.metadata.id,
+            workspace=harness.workspace,
+            workspace_provider=RecordingWorkspaceProvider(),
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=model,
+            granted_capabilities=granted_capabilities(),
+        )
+
+        invocation = (
+            await harness.role_invocations.list_by_work_item(
+                harness.work_item.metadata.id
+            )
+        )[0]
+
+        assert result.status == LiteralRuntimeStatus.INVALID_OUTPUT
+        assert invocation.status.phase == RoleInvocationPhase.FAILED
+        assert invocation.status.failure is not None
+        assert invocation.status.failure.reason == "CodingOutputInvalid"
+        assert invocation.status.failure.message == (
+            "completed CodingOutput must produce observed workspace changes "
+            "for this WorkItem"
+        )
+        assert len(model.calls) == 3
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_coding_runtime_repairs_command_requests_then_accepts_changed_workspace(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        command_request = {
+            "commandsRequested": (
+                {
+                    "command": "uvicorn main:app --reload",
+                    "purpose": "Verify the health endpoint locally.",
+                },
+            )
+        }
+        model = RecordingModelProvider(
+            (
+                command_request,
+                tool_call(
+                    "write-file",
+                    {
+                        "path": "main.py",
+                        "content": (
+                            "from fastapi import FastAPI\n\n"
+                            "app = FastAPI()\n\n"
+                            "@app.get('/health')\n"
+                            "def health():\n"
+                            "    return {'status': 'ok'}\n"
+                        ),
+                    },
+                ),
+                {
+                    "commandsRequested": (
+                        {
+                            "command": ("uvicorn", "main:app", "--reload"),
+                            "purpose": "Verify the health endpoint locally.",
+                        },
+                    )
+                },
+            )
+        )
+        workspace_provider = FilesystemStatusWorkspaceProvider(
+            tmp_path / "workspace",
+            "main.py",
+        )
+
+        result = await harness.runtime.invoke_coding(
+            harness.work_item.metadata.id,
+            workspace=harness.workspace,
+            workspace_provider=workspace_provider,
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=model,
+            granted_capabilities=granted_capabilities(),
+        )
+
+        assert result.status == CodingOutputStatus.COMPLETED
+        assert result.output is not None
+        assert result.output.commands_requested[0].command == (
+            "uvicorn main:app --reload"
+        )
+        assert "FastAPI" in (tmp_path / "workspace" / "main.py").read_text()
+        assert len(model.calls) == 3
+        assert (
+            "completed CodingOutput must produce observed workspace changes"
+            in model.calls[1].messages[-1].content
+        )
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_coding_runtime_repairs_completed_output_without_observed_changes(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        model = RecordingModelProvider(
+            (
+                completed_output(
+                    summary="No changes detected in the workspace. Try again."
+                ),
+                tool_call(
+                    "write-file",
+                    {
+                        "path": "app.py",
+                        "content": (
+                            "from fastapi import FastAPI\n\n"
+                            "app = FastAPI()\n\n"
+                            "@app.get('/health')\n"
+                            "def health():\n"
+                            "    return {'status': 'ok'}\n"
+                        ),
+                    },
+                ),
+                completed_output(
+                    summary="Created health endpoint.",
+                    changed_path="app.py",
+                ),
+            )
+        )
+        workspace_provider = FilesystemStatusWorkspaceProvider(
+            tmp_path / "workspace",
+            "app.py",
+        )
+
+        result = await harness.runtime.invoke_coding(
+            harness.work_item.metadata.id,
+            workspace=harness.workspace,
+            workspace_provider=workspace_provider,
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=model,
+            granted_capabilities=granted_capabilities(),
+        )
+
+        assert result.status == CodingOutputStatus.COMPLETED
+        assert "FastAPI" in (tmp_path / "workspace" / "app.py").read_text()
+        assert len(model.calls) == 3
+        assert (
+            "completed CodingOutput must produce observed workspace changes"
+            in model.calls[1].messages[-1].content
+        )
+        harness.close()
+
+    asyncio.run(scenario())
+
+
 def test_coding_runtime_rejects_invalid_final_output(tmp_path: Path) -> None:
     async def scenario() -> None:
         harness = await make_harness(tmp_path)
-        model = RecordingModelProvider(({"status": "completed"},))
+        model = RecordingModelProvider(
+            (
+                {"status": "completed"},
+                {"status": "completed"},
+                {"status": "completed"},
+            )
+        )
 
         result = await harness.runtime.invoke_coding(
             harness.work_item.metadata.id,
@@ -522,7 +964,7 @@ def test_coding_runtime_rejects_completed_output_with_questions(
         harness = await make_harness(tmp_path)
         output = completed_output()
         output["questions"] = ("Should this be implemented?",)
-        model = RecordingModelProvider((output,))
+        model = RecordingModelProvider((output, output, output))
 
         result = await harness.runtime.invoke_coding(
             harness.work_item.metadata.id,
@@ -554,10 +996,250 @@ def test_coding_runtime_rejects_completed_output_with_questions(
     asyncio.run(scenario())
 
 
+def test_coding_runtime_rejects_blocked_output_without_blockers(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        output = {
+            "status": "blocked",
+            "summary": "No changes are needed.",
+            "changedFiles": (),
+            "commandsRequested": (
+                {
+                    "command": "run-command",
+                    "purpose": "Create the requested endpoint.",
+                },
+            ),
+            "remainingIssues": (),
+            "questions": (),
+        }
+        model = RecordingModelProvider((output, output, output))
+
+        result = await harness.runtime.invoke_coding(
+            harness.work_item.metadata.id,
+            workspace=harness.workspace,
+            workspace_provider=RecordingWorkspaceProvider(),
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=model,
+            granted_capabilities=granted_capabilities(),
+        )
+
+        updated_item = await harness.work_items.get(harness.work_item.metadata.id)
+        invocation = (
+            await harness.role_invocations.list_by_work_item(
+                harness.work_item.metadata.id
+            )
+        )[0]
+
+        assert result.status == LiteralRuntimeStatus.INVALID_OUTPUT
+        assert updated_item.status.phase == WorkItemPhase.FAILED
+        assert invocation.status.phase == RoleInvocationPhase.FAILED
+        assert invocation.status.failure is not None
+        assert invocation.status.failure.reason == "CodingOutputInvalid"
+        assert invocation.status.failure.message == (
+            "blocked CodingOutput must include at least one question"
+        )
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_coding_runtime_repairs_blocked_output_without_questions(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        bad_output = {
+            "status": "blocked",
+            "summary": "README.md needs to be updated.",
+            "changedFiles": (),
+            "commandsRequested": (),
+            "remainingIssues": ("README.md needs to be updated.",),
+            "questions": (),
+        }
+        model = RecordingModelProvider(
+            (
+                bad_output,
+                tool_call(
+                    "write-file",
+                    {
+                        "path": "README.md",
+                        "content": "# Demo\n\nRun with `uvicorn app:app`.\n",
+                    },
+                ),
+                completed_output(
+                    summary="Updated README instructions.",
+                    changed_path="README.md",
+                ),
+            )
+        )
+        workspace_provider = RecordingWorkspaceProvider(
+            status_stdout=" M README.md\n",
+            diff="diff --git a/README.md b/README.md\n+# Demo\n",
+        )
+
+        result = await harness.runtime.invoke_coding(
+            harness.work_item.metadata.id,
+            workspace=harness.workspace,
+            workspace_provider=workspace_provider,
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=model,
+            granted_capabilities=granted_capabilities(),
+        )
+
+        assert result.status == CodingOutputStatus.COMPLETED
+        assert (tmp_path / "workspace" / "README.md").read_text() == (
+            "# Demo\n\nRun with `uvicorn app:app`.\n"
+        )
+        assert len(model.calls) == 3
+        assert (
+            "blocked CodingOutput must include at least one question"
+            in model.calls[1].messages[-1].content
+        )
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_coding_runtime_repairs_permission_question_answered_by_capability(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        bad_output = {
+            "status": "blocked",
+            "questions": (
+                "Do you have permission to create directories and files "
+                "within the workspace?",
+            ),
+        }
+        model = RecordingModelProvider(
+            (
+                bad_output,
+                tool_call(
+                    "write-file",
+                    {
+                        "path": "fastapi_app/main.py",
+                        "content": (
+                            "from fastapi import FastAPI\n\n"
+                            "app = FastAPI()\n\n"
+                            "@app.get('/health')\n"
+                            "def health():\n"
+                            "    return {'status': 'ok'}\n"
+                        ),
+                    },
+                ),
+                completed_output(
+                    summary="Created FastAPI application files.",
+                    changed_path="fastapi_app/main.py",
+                ),
+            )
+        )
+        workspace_provider = RecordingWorkspaceProvider(
+            status_stdout="?? fastapi_app/main.py\n",
+            diff=(
+                "diff --git a/fastapi_app/main.py b/fastapi_app/main.py\n"
+                "+from fastapi import FastAPI\n"
+            ),
+        )
+
+        result = await harness.runtime.invoke_coding(
+            harness.work_item.metadata.id,
+            workspace=harness.workspace,
+            workspace_provider=workspace_provider,
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=model,
+            granted_capabilities=granted_capabilities(),
+        )
+
+        assert result.status == CodingOutputStatus.COMPLETED
+        assert (tmp_path / "workspace" / "fastapi_app" / "main.py").exists()
+        assert len(model.calls) == 3
+        assert (
+            "granted Capabilities are already authorization"
+            in model.calls[1].messages[-1].content
+        )
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_coding_runtime_repairs_create_file_confirmation_for_implementation_item(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        bad_output = {
+            "status": "blocked",
+            "summary": (
+                "No files found in the workspace. Please create a new file "
+                "for the GET /health endpoint."
+            ),
+            "changedFiles": (),
+            "commandsRequested": (),
+            "remainingIssues": (),
+            "questions": (
+                "Do you want to create a new file for the GET /health endpoint?",
+            ),
+        }
+        model = RecordingModelProvider(
+            (
+                bad_output,
+                tool_call(
+                    "write-file",
+                    {
+                        "path": "main.py",
+                        "content": (
+                            "from fastapi import FastAPI\n\n"
+                            "app = FastAPI()\n\n"
+                            "@app.get('/health')\n"
+                            "def health():\n"
+                            "    return {'status': 'ok'}\n"
+                        ),
+                    },
+                ),
+                completed_output(
+                    summary="Created FastAPI health endpoint.",
+                    changed_path="main.py",
+                ),
+            )
+        )
+        workspace_provider = FilesystemStatusWorkspaceProvider(
+            tmp_path / "workspace",
+            "main.py",
+        )
+
+        result = await harness.runtime.invoke_coding(
+            harness.work_item.metadata.id,
+            workspace=harness.workspace,
+            workspace_provider=workspace_provider,
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=model,
+            granted_capabilities=granted_capabilities(),
+        )
+
+        assert result.status == CodingOutputStatus.COMPLETED
+        assert "FastAPI" in (tmp_path / "workspace" / "main.py").read_text()
+        assert len(model.calls) == 3
+        assert (
+            "asks for confirmation to perform implementation work"
+            in model.calls[1].messages[-1].content
+        )
+        harness.close()
+
+    asyncio.run(scenario())
+
+
 def test_coding_runtime_rejects_invalid_tool_call_output(tmp_path: Path) -> None:
     async def scenario() -> None:
         harness = await make_harness(tmp_path)
-        model = RecordingModelProvider(({"toolCalls": {"name": "write-file"}},))
+        output = {"toolCalls": {"name": "write-file"}}
+        model = RecordingModelProvider((output, output, output))
 
         result = await harness.runtime.invoke_coding(
             harness.work_item.metadata.id,
@@ -582,6 +1264,67 @@ def test_coding_runtime_rejects_invalid_tool_call_output(tmp_path: Path) -> None
         assert invocation.status.failure is not None
         assert invocation.status.failure.reason == "CodingToolCallsInvalid"
         assert result.tool_artifact_refs == ()
+        assert len(model.calls) == 3
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_coding_runtime_repairs_invalid_tool_call_output(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        model = RecordingModelProvider(
+            (
+                {
+                    "toolCalls": (
+                        {
+                            "name": "read-file",
+                            "arguments": {"path": "."},
+                            "artifactRef": {
+                                "kind": "Artifact",
+                                "id": str(uuid4()),
+                                "name": "tool-read-file",
+                            },
+                        },
+                    )
+                },
+                tool_call(
+                    "write-file",
+                    {
+                        "path": "main.py",
+                        "content": (
+                            "from fastapi import FastAPI\n\n"
+                            "app = FastAPI()\n\n"
+                            "@app.get('/health')\n"
+                            "def health():\n"
+                            "    return {'status': 'ok'}\n"
+                        ),
+                    },
+                ),
+                completed_output(
+                    summary="Created FastAPI health endpoint.",
+                    changed_path="main.py",
+                ),
+            )
+        )
+        workspace_provider = FilesystemStatusWorkspaceProvider(
+            tmp_path / "workspace",
+            "main.py",
+        )
+
+        result = await harness.runtime.invoke_coding(
+            harness.work_item.metadata.id,
+            workspace=harness.workspace,
+            workspace_provider=workspace_provider,
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=model,
+            granted_capabilities=granted_capabilities(),
+        )
+
+        assert result.status == CodingOutputStatus.COMPLETED
+        assert "FastAPI" in (tmp_path / "workspace" / "main.py").read_text()
+        assert "CodingToolCallsInvalid" in model.calls[1].messages[-1].content
         harness.close()
 
     asyncio.run(scenario())

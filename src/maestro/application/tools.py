@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import shlex
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 from maestro.application.artifacts import ArtifactService
 from maestro.domain.artifacts import (
@@ -68,6 +69,17 @@ DENIED_EXECUTABLES = frozenset(
     }
 )
 SHELL_EXECUTABLES = frozenset({"bash", "fish", "sh", "zsh"})
+LONG_RUNNING_SERVER_EXECUTABLES = frozenset(
+    {
+        "fastapi",
+        "flask",
+        "gradio",
+        "gunicorn",
+        "hypercorn",
+        "streamlit",
+        "uvicorn",
+    }
+)
 SHELL_SYNTAX_TOKENS = frozenset(
     {
         ">",
@@ -153,6 +165,38 @@ class RunCommandInput(MaestroModel):
     cwd: str | None = None
     timeout_seconds: int | None = Field(default=None, ge=1, alias="timeoutSeconds")
     capability: CapabilityName = "shell.execute.test"
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_path_only_request(cls, value: Any) -> Any:
+        """Treat a directory-only local-model request as a harmless listing."""
+
+        if (
+            isinstance(value, dict)
+            and "command" not in value
+            and isinstance(value.get("path"), str)
+            and value["path"].strip()
+        ):
+            normalized = dict(value)
+            path = normalized.pop("path")
+            normalized["command"] = ("ls", "-la")
+            normalized.setdefault("cwd", path)
+            return normalized
+        return value
+
+    @field_validator("command", mode="before")
+    @classmethod
+    def normalize_command(cls, value: Any) -> Any:
+        """Accept common model-emitted command forms and normalize to argv."""
+
+        if isinstance(value, str):
+            try:
+                return tuple(shlex.split(value))
+            except ValueError as error:
+                raise ValueError("command string must parse as argv") from error
+        if isinstance(value, list | tuple):
+            return tuple(str(part) for part in value)
+        return value
 
 
 class GitStatusInput(MaestroModel):
@@ -354,7 +398,7 @@ class CodingToolRuntime:
         match definition.name:
             case "list-files":
                 assert isinstance(tool_input, ListFilesInput)
-                output, truncated = _list_files(root, tool_input)
+                output, truncated = _list_files(workspace, root, tool_input)
                 return (
                     output,
                     truncated,
@@ -364,7 +408,12 @@ class CodingToolRuntime:
                 )
             case "read-file":
                 assert isinstance(tool_input, ReadFileInput)
-                output, truncated = _read_file(root, tool_input, self._max_output_bytes)
+                output, truncated = _read_file(
+                    workspace,
+                    root,
+                    tool_input,
+                    self._max_output_bytes,
+                )
                 return (
                     output,
                     truncated,
@@ -374,11 +423,11 @@ class CodingToolRuntime:
                 )
             case "write-file":
                 assert isinstance(tool_input, WriteFileInput)
-                output = _write_file(root, tool_input)
+                output = _write_file(workspace, root, tool_input)
                 return output, False, ArtifactType.TOOL_LOG, "application/json", None
             case "edit-file":
                 assert isinstance(tool_input, EditFileInput)
-                output = _edit_file(root, tool_input)
+                output = _edit_file(workspace, root, tool_input)
                 return output, False, ArtifactType.TOOL_LOG, "application/json", None
             case "run-command":
                 assert isinstance(tool_input, RunCommandInput)
@@ -667,10 +716,12 @@ def _workspace_root(workspace: Workspace) -> Path:
 
 
 def _list_files(
+    workspace: Workspace,
     root: Path,
     tool_input: ListFilesInput,
 ) -> tuple[dict[str, Any], bool]:
     directory = _resolve_path(
+        workspace,
         root,
         tool_input.path,
         must_exist=True,
@@ -705,11 +756,13 @@ def _list_files(
 
 
 def _read_file(
+    workspace: Workspace,
     root: Path,
     tool_input: ReadFileInput,
     runtime_max_output_bytes: int,
 ) -> tuple[dict[str, Any], bool]:
     target = _resolve_path(
+        workspace,
         root,
         tool_input.path,
         must_exist=True,
@@ -729,8 +782,13 @@ def _read_file(
     }, truncated
 
 
-def _write_file(root: Path, tool_input: WriteFileInput) -> dict[str, Any]:
+def _write_file(
+    workspace: Workspace,
+    root: Path,
+    tool_input: WriteFileInput,
+) -> dict[str, Any]:
     target = _resolve_path(
+        workspace,
         root,
         tool_input.path,
         must_exist=False,
@@ -752,8 +810,13 @@ def _write_file(root: Path, tool_input: WriteFileInput) -> dict[str, Any]:
     }
 
 
-def _edit_file(root: Path, tool_input: EditFileInput) -> dict[str, Any]:
+def _edit_file(
+    workspace: Workspace,
+    root: Path,
+    tool_input: EditFileInput,
+) -> dict[str, Any]:
     target = _resolve_path(
+        workspace,
         root,
         tool_input.path,
         must_exist=True,
@@ -790,10 +853,16 @@ async def _run_command(
 ) -> tuple[dict[str, Any], bool]:
     provider = _require_workspace_provider(workspace_provider)
     _validate_command_policy(tool_input.command)
-    _validate_command_path_arguments(root, tool_input.command, tool_input.capability)
+    _validate_command_path_arguments(
+        root,
+        tool_input.command,
+        tool_input.capability,
+        workspace=workspace,
+    )
     cwd = None
     if tool_input.cwd is not None:
         cwd = _resolve_path(
+            workspace,
             root,
             tool_input.cwd,
             must_exist=True,
@@ -875,7 +944,41 @@ async def _git_diff(
     return {"diff": text, "staged": tool_input.staged}, truncated
 
 
+def _normalize_repository_alias_path(
+    workspace: Workspace | None,
+    root: Path,
+    requested_path: str | Path,
+) -> str | Path:
+    if workspace is None:
+        return requested_path
+
+    repository_ref = str(workspace.spec.repository_ref)
+    if not repository_ref:
+        return requested_path
+
+    requested = Path(requested_path)
+    if requested.is_absolute():
+        try:
+            relative = requested.resolve(strict=False).relative_to(
+                root.resolve(strict=True)
+            )
+        except (OSError, ValueError):
+            return requested_path
+    else:
+        relative = requested
+
+    if not relative.parts or relative.parts[0] != repository_ref:
+        return requested_path
+
+    stripped_parts = relative.parts[1:]
+    stripped = Path(*stripped_parts) if stripped_parts else Path(".")
+    if requested.is_absolute():
+        return root.resolve(strict=True) / stripped
+    return stripped
+
+
 def _resolve_path(
+    workspace: Workspace | None,
     root: Path,
     requested_path: str | Path,
     *,
@@ -884,6 +987,11 @@ def _resolve_path(
     must_be_file: bool = False,
     must_be_dir: bool = False,
 ) -> Path:
+    requested_path = _normalize_repository_alias_path(
+        workspace,
+        root,
+        requested_path,
+    )
     try:
         target = resolve_workspace_child(root, requested_path)
     except ValueError as error:
@@ -932,6 +1040,24 @@ def _validate_command_policy(command: tuple[str, ...]) -> None:
             "CommandDenied",
             "shell -c commands are denied by command policy",
         )
+    if executable in LONG_RUNNING_SERVER_EXECUTABLES:
+        raise ToolPolicyDeniedError(
+            "LongRunningServerDenied",
+            (
+                "run-command is for short verification commands; use a test "
+                "command or an in-process client instead of starting a long-running "
+                f"{executable} server"
+            ),
+        )
+    if executable.startswith("python") and args[:2] == ("-m", "uvicorn"):
+        raise ToolPolicyDeniedError(
+            "LongRunningServerDenied",
+            (
+                "run-command is for short verification commands; use a test "
+                "command or an in-process client instead of starting a long-running "
+                "uvicorn server"
+            ),
+        )
     if any(_contains_shell_syntax(argument) for argument in args):
         raise ToolPolicyDeniedError(
             "ShellSyntaxDenied",
@@ -972,10 +1098,13 @@ def _validate_command_path_arguments(
     root: Path,
     command: tuple[str, ...],
     capability: CapabilityName,
+    *,
+    workspace: Workspace | None = None,
 ) -> None:
     for argument in command[1:]:
         for candidate in _path_candidates(argument):
             _resolve_path(
+                workspace,
                 root,
                 candidate,
                 must_exist=False,

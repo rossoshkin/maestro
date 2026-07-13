@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 from collections.abc import Iterable
 from typing import Any
 from uuid import UUID, uuid4
+
+from pydantic import Field, ValidationError
 
 from maestro.application.artifacts import ArtifactService
 from maestro.application.coding import CodingRuntime
@@ -60,6 +63,7 @@ from maestro.domain.capabilities import (
     CapabilityBindingRepository,
     CapabilityBindingSpec,
     CapabilityBindingStatus,
+    CapabilityName,
     CapabilityPhase,
     CapabilityRepository,
     CapabilityScope,
@@ -86,20 +90,30 @@ from maestro.domain.providers import (
     ProviderDataPolicy,
     ProviderFailure,
     ProviderFeatureSet,
+    ProviderMessage,
+    ProviderMessageRole,
+    ProviderOperationError,
     ProviderPhase,
     ProviderRepository,
     ProviderSpec,
     ProviderStatus,
+    StructuredGenerationRequest,
 )
 from maestro.domain.repositories import ResourceSelector
 from maestro.domain.resources import (
     BaseResource,
     ConditionStatus,
+    MaestroModel,
     ResourceName,
     ResourceReference,
+    utc_now,
 )
 from maestro.domain.reviews import ReviewPhase, ReviewRepository
-from maestro.domain.role_invocations import RoleInvocationRepository
+from maestro.domain.role_invocations import (
+    RoleInvocation,
+    RoleInvocationPhase,
+    RoleInvocationRepository,
+)
 from maestro.domain.roles import (
     Role,
     RoleExecutionPolicy,
@@ -146,6 +160,40 @@ DEFAULT_CODING_CAPABILITIES = (
     "git.diff",
 )
 RUNNER_MAX_STEPS = 40
+RUNNER_FAILURE_PHASES = frozenset(
+    {
+        ExecutionPhase.PLANNING,
+        ExecutionPhase.PREPARING_WORKSPACE,
+        ExecutionPhase.EXECUTING,
+        ExecutionPhase.VERIFYING,
+        ExecutionPhase.REVIEWING,
+    }
+)
+PLANNER_REPAIR_ADVISOR_PROMPT = (
+    "You are Maestro's Planner in advisor mode. Diagnose why the Coding "
+    "Role failed one approved WorkItem and provide concrete instructions for "
+    "retrying the same WorkItem. Do not rewrite the plan, add work items, ask "
+    "for user approval, or suggest manual shell commands for the user."
+)
+
+
+class PlannerRepairAdvice(MaestroModel):
+    """Planner guidance for retrying a failed Coding WorkItem."""
+
+    summary: str = Field(min_length=1)
+    instructions: tuple[str, ...] = Field(default_factory=tuple)
+
+
+def _effective_coding_capabilities(
+    requested: tuple[CapabilityName, ...],
+) -> tuple[CapabilityName, ...]:
+    """Grant the local safe coding tool set plus any scheduler-approved extras."""
+
+    granted: list[CapabilityName] = list(DEFAULT_CODING_CAPABILITIES)
+    for capability in requested:
+        if capability not in granted:
+            granted.append(capability)
+    return tuple(granted)
 
 
 class LocalExecutionRunner:
@@ -273,8 +321,9 @@ class LocalExecutionRunner:
 
     async def _run_planning(self, execution: Execution) -> None:
         plans = await self._plans.list_by_execution(execution.metadata.id)
-        if plans:
-            await self._prepare_plan_for_approval(execution, _latest_plan(plans))
+        reusable_plan = _latest_reusable_plan(plans)
+        if reusable_plan is not None:
+            await self._prepare_plan_for_approval(execution, reusable_plan)
             await self._reconcile_execution(execution)
             return
 
@@ -326,7 +375,7 @@ class LocalExecutionRunner:
         for plan in plans:
             await self._plan_controller().reconcile(_context_for(plan))
             updated = await self._plans.get(plan.metadata.id)
-            if updated.status.phase == PlanPhase.APPROVED:
+            if updated.status.phase in {PlanPhase.APPROVED, PlanPhase.REJECTED}:
                 await self._plan_controller().reconcile(_context_for(updated))
                 advanced = True
         if advanced:
@@ -421,10 +470,15 @@ class LocalExecutionRunner:
         workspace = await self._workspaces.get(work_item.spec.workspace_ref.id)
         agent = await self._agents.get(work_item.status.assigned_agent_ref.id)
         provider = await self._ensure_ollama_provider(work_item.metadata.namespace)
+        coding_context = await self._coding_context(execution, work_item, provider)
         await self._publish_runner_event(
             execution,
             "CodingRunStarted",
-            {"workItemId": str(work_item.metadata.id), "agent": agent.metadata.name},
+            {
+                "workItemId": str(work_item.metadata.id),
+                "agent": agent.metadata.name,
+                "attempt": work_item.status.attempt + 1,
+            },
             subject=work_item,
         )
         try:
@@ -435,13 +489,106 @@ class LocalExecutionRunner:
                 agent=agent,
                 provider=provider,
                 runtime=OllamaProvider.from_provider(provider),
-                granted_capabilities=work_item.spec.requested_capabilities
-                or DEFAULT_CODING_CAPABILITIES,
+                granted_capabilities=_effective_coding_capabilities(
+                    work_item.spec.requested_capabilities
+                ),
                 max_steps=execution.spec.limits.max_tool_calls_per_invocation,
                 max_duration_seconds=execution.spec.limits.max_duration_seconds,
+                context=coding_context,
             )
         finally:
             await self._release_agent_assignment(work_item.status.assigned_agent_ref)
+
+    async def _coding_context(
+        self,
+        execution: Execution,
+        work_item: WorkItem,
+        provider: Provider,
+    ) -> dict[str, Any]:
+        failure_context = await self._previous_coding_failure_context(
+            execution,
+            work_item,
+        )
+        if failure_context is None:
+            return {}
+
+        context: dict[str, Any] = {"previousCodingFailure": failure_context}
+        advice = await self._planner_repair_advice(
+            execution,
+            work_item,
+            provider,
+            failure_context,
+        )
+        if advice is not None:
+            context["plannerRepairAdvice"] = advice.model_dump(
+                mode="json",
+                by_alias=True,
+            )
+        return context
+
+    async def _planner_repair_advice(
+        self,
+        execution: Execution,
+        work_item: WorkItem,
+        provider: Provider,
+        failure_context: dict[str, Any],
+    ) -> PlannerRepairAdvice | None:
+        await self._publish_runner_event(
+            execution,
+            "PlannerRepairAdviceStarted",
+            {
+                "workItemId": str(work_item.metadata.id),
+                "attempt": work_item.status.attempt + 1,
+            },
+            subject=work_item,
+        )
+        runtime = OllamaProvider.from_provider(provider)
+        try:
+            response = await runtime.generate_structured(
+                StructuredGenerationRequest(
+                    model=_planner_model(provider),
+                    messages=(
+                        ProviderMessage(
+                            role=ProviderMessageRole.SYSTEM,
+                            content=PLANNER_REPAIR_ADVISOR_PROMPT,
+                        ),
+                        ProviderMessage(
+                            role=ProviderMessageRole.USER,
+                            content=_planner_repair_advice_prompt(
+                                execution,
+                                work_item,
+                                failure_context,
+                            ),
+                        ),
+                    ),
+                    responseSchema=PlannerRepairAdvice.model_json_schema(by_alias=True),
+                    timeoutSeconds=provider.spec.timeout_seconds,
+                )
+            )
+            advice = PlannerRepairAdvice.model_validate(response.output)
+        except (ProviderOperationError, ValidationError, ValueError) as error:
+            await self._publish_runner_event(
+                execution,
+                "PlannerRepairAdviceFailed",
+                {
+                    "workItemId": str(work_item.metadata.id),
+                    "message": str(error),
+                },
+                subject=work_item,
+            )
+            return None
+
+        await self._publish_runner_event(
+            execution,
+            "PlannerRepairAdviceProduced",
+            {
+                "workItemId": str(work_item.metadata.id),
+                "summary": advice.summary,
+                "instructions": advice.instructions,
+            },
+            subject=work_item,
+        )
+        return advice
 
     async def _verify_work_items(self, execution: Execution) -> None:
         await self._verify_pending_work_items(execution)
@@ -951,16 +1098,22 @@ class LocalExecutionRunner:
     ) -> None:
         work_items = await self._work_items.list_by_execution(execution.metadata.id)
         for work_item in work_items:
-            if work_item.spec.workspace_ref is not None:
+            updates: dict[str, Any] = {}
+            if work_item.spec.workspace_ref is None:
+                updates["workspace_ref"] = WorkItemWorkspaceReference(
+                    id=workspace.metadata.id,
+                    name=workspace.metadata.name,
+                )
+            if (
+                work_item.spec.retry_policy.max_attempts
+                < execution.spec.limits.max_coding_iterations
+            ):
+                updates["retry_policy"] = work_item.spec.retry_policy.model_copy(
+                    update={"max_attempts": execution.spec.limits.max_coding_iterations}
+                )
+            if not updates:
                 continue
-            spec = work_item.spec.model_copy(
-                update={
-                    "workspace_ref": WorkItemWorkspaceReference(
-                        id=workspace.metadata.id,
-                        name=workspace.metadata.name,
-                    )
-                }
-            )
+            spec = work_item.spec.model_copy(update=updates)
             await self._work_items.update_spec(
                 work_item.metadata.id,
                 spec,
@@ -1077,6 +1230,83 @@ class LocalExecutionRunner:
             "userAnswers": tuple(answers),
         }
 
+    async def _previous_coding_failure_context(
+        self,
+        execution: Execution,
+        work_item: WorkItem,
+    ) -> dict[str, Any] | None:
+        if work_item.status.attempt == 0:
+            return None
+        invocations = await self._role_invocations.list_by_execution(
+            execution.metadata.id
+        )
+        failed_invocations = tuple(
+            invocation
+            for invocation in invocations
+            if invocation.spec.work_item_ref is not None
+            and invocation.spec.work_item_ref.id == work_item.metadata.id
+            and invocation.status.phase
+            in {
+                RoleInvocationPhase.FAILED,
+                RoleInvocationPhase.TIMED_OUT,
+            }
+        )
+        if not failed_invocations:
+            return None
+
+        invocation = _latest_role_invocation(failed_invocations)
+        condition = _latest_condition(work_item, "Coding")
+        invocation_failure = invocation.status.failure
+        context = {
+            "workItemId": str(work_item.metadata.id),
+            "name": work_item.metadata.name,
+            "planWorkItemId": work_item.spec.plan_work_item_id,
+            "objective": work_item.spec.objective,
+            "attemptsCompleted": work_item.status.attempt,
+            "conditionReason": condition.reason if condition else "",
+            "conditionMessage": condition.message if condition else "",
+            "invocationId": str(invocation.metadata.id),
+            "invocationPhase": invocation.status.phase,
+            "invocationFailureReason": (
+                invocation_failure.reason if invocation_failure else ""
+            ),
+            "invocationFailureMessage": (
+                invocation_failure.message if invocation_failure else ""
+            ),
+        }
+        tool_failures = await self._tool_failure_context(invocation)
+        if tool_failures:
+            context["toolFailures"] = tool_failures
+        return context
+
+    async def _tool_failure_context(
+        self,
+        invocation: RoleInvocation,
+    ) -> tuple[dict[str, Any], ...]:
+        failures: list[dict[str, Any]] = []
+        for artifact_ref in invocation.status.output_artifact_refs:
+            try:
+                artifact = await self._artifacts.get(artifact_ref.id)
+                raw_content = await self._artifact_storage.read_bytes(artifact)
+                payload = json.loads(raw_content.decode("utf-8"))
+            except Exception:  # noqa: BLE001 - retry context is best-effort evidence.
+                continue
+            if not isinstance(payload, dict):
+                continue
+            status = payload.get("status")
+            if status not in {"denied", "failed"}:
+                continue
+            failures.append(
+                {
+                    "toolName": payload.get("toolName", ""),
+                    "status": status,
+                    "message": payload.get("message", ""),
+                    "arguments": payload.get("arguments", {}),
+                    "output": payload.get("output", {}),
+                }
+            )
+        return tuple(failures[-3:])
+
     def _execution_controller(self) -> ExecutionController:
         return ExecutionController(
             self._executions,
@@ -1162,6 +1392,27 @@ class LocalExecutionRunner:
                 "message": str(error),
             },
         )
+        if execution.status.phase in RUNNER_FAILURE_PHASES:
+            status = execution.status.model_copy(
+                update={
+                    "observed_generation": execution.metadata.generation,
+                    "phase": ExecutionPhase.FAILED,
+                    "completed_at": utc_now(),
+                }
+            )
+            status = with_condition(
+                execution,
+                status,
+                condition_type="Reconciled",
+                condition_status=ConditionStatus.FALSE,
+                reason="RunnerFailed",
+                message=str(error),
+            )
+            await self._executions.update_status(
+                execution.metadata.id,
+                status,
+                expected_resource_version=execution.metadata.resource_version,
+            )
 
     async def _publish_runner_event(
         self,
@@ -1213,8 +1464,72 @@ def _is_retryable_role_catalog_block(work_item: WorkItem) -> bool:
     )
 
 
-def _latest_plan(plans: Iterable[Plan]) -> Plan:
-    return max(plans, key=lambda plan: plan.spec.version)
+def _latest_reusable_plan(plans: Iterable[Plan]) -> Plan | None:
+    plan_versions = tuple(plans)
+    if not plan_versions:
+        return None
+    latest = max(plan_versions, key=lambda plan: plan.spec.version)
+    if latest.status.phase not in {PlanPhase.WAITING_FOR_APPROVAL, PlanPhase.APPROVED}:
+        return None
+    return latest
+
+
+def _latest_role_invocation(invocations: Iterable[RoleInvocation]) -> RoleInvocation:
+    return max(
+        invocations,
+        key=lambda invocation: (
+            invocation.status.completed_at
+            or invocation.status.started_at
+            or invocation.metadata.updated_at
+        ),
+    )
+
+
+def _latest_condition(resource: BaseResource[Any, Any], condition_type: str) -> Any:
+    return next(
+        (
+            condition
+            for condition in resource.status.conditions
+            if condition.type == condition_type
+        ),
+        None,
+    )
+
+
+def _planner_repair_advice_prompt(
+    execution: Execution,
+    work_item: WorkItem,
+    failure_context: dict[str, Any],
+) -> str:
+    prompt = {
+        "mode": "coding-repair-advice",
+        "instructions": (
+            "Advise the next Coding Role attempt for this same WorkItem. "
+            "Preserve the approved plan and focus on the smallest concrete "
+            "change that should unblock coding."
+        ),
+        "executionGoal": execution.spec.goal.model_dump(mode="json", by_alias=True),
+        "workItem": {
+            "id": str(work_item.metadata.id),
+            "name": work_item.metadata.name,
+            "objective": work_item.spec.objective,
+            "constraints": work_item.spec.constraints,
+            "acceptanceCriteria": work_item.spec.acceptance_criteria,
+            "verification": work_item.spec.verification.model_dump(
+                mode="json",
+                by_alias=True,
+            ),
+        },
+        "previousCodingFailure": failure_context,
+        "outputContract": {
+            "summary": "Brief diagnosis of why the previous attempt failed.",
+            "instructions": (
+                "Ordered concrete instructions for the next coding attempt. "
+                "Do not include manual steps for the human user."
+            ),
+        },
+    }
+    return json.dumps(prompt, indent=2, sort_keys=True)
 
 
 def _primary_repository(project: Project) -> Any:

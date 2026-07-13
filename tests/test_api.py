@@ -9,6 +9,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient, Response
 
 from maestro.application.artifacts import ArtifactService
@@ -52,7 +53,12 @@ from maestro.domain.role_invocations import (
     RoleInvocationRoleReference,
     RoleInvocationSpec,
 )
-from maestro.presentation.api import ApiContext, create_api_context, create_app
+from maestro.presentation.api import (
+    ApiContext,
+    _schedule_execution_run,
+    create_api_context,
+    create_app,
+)
 
 
 def api_settings(tmp_path: Path) -> Settings:
@@ -139,6 +145,17 @@ def run_git(git: str, cwd: Path, *args: str) -> str:
     )
     assert completed.returncode == 0, completed.stderr
     return completed.stdout.strip()
+
+
+async def _drain_execution_tasks(app: FastAPI) -> None:
+    tasks = tuple(app.state.maestro_execution_tasks.values())
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    app.state.maestro_execution_tasks.clear()
+    app.state.maestro_execution_run_pending.clear()
 
 
 def create_source_repository(tmp_path: Path) -> Path:
@@ -550,6 +567,166 @@ def test_execution_run_action_schedules_background_runner_when_enabled(
 
                 assert run_response.status_code == 200
                 assert scheduled == [UUID(draft["metadata"]["id"])]
+        finally:
+            context.close()
+
+    asyncio.run(scenario())
+
+
+def test_execution_run_scheduler_queues_follow_up_when_runner_is_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        settings = api_settings(tmp_path)
+        context = create_api_context(settings)
+        app = create_app(settings, api_context=context)
+        app.state.maestro_auto_run_enabled = True
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        scheduled: list[UUID] = []
+
+        class FakeRunner:
+            def __init__(self, **_: object) -> None:
+                pass
+
+            async def run(self, execution_id: UUID) -> None:
+                scheduled.append(execution_id)
+                if len(scheduled) == 1:
+                    first_started.set()
+                    await release_first.wait()
+
+        monkeypatch.setattr("maestro.presentation.api.LocalExecutionRunner", FakeRunner)
+        try:
+            execution_id = uuid4()
+
+            _schedule_execution_run(app, context, execution_id)
+            await first_started.wait()
+            _schedule_execution_run(app, context, execution_id)
+
+            assert scheduled == [execution_id]
+            assert app.state.maestro_execution_run_pending == {execution_id}
+
+            release_first.set()
+            for _ in range(10):
+                if len(scheduled) == 2:
+                    break
+                await asyncio.sleep(0)
+
+            assert scheduled == [execution_id, execution_id]
+            assert app.state.maestro_execution_run_pending == set()
+        finally:
+            await _drain_execution_tasks(app)
+            context.close()
+
+    asyncio.run(scenario())
+
+
+def test_clear_data_action_cancels_active_and_pending_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        settings = api_settings(tmp_path)
+        context = create_api_context(settings)
+        app = create_app(settings, api_context=context)
+        app.state.maestro_auto_run_enabled = True
+        transport = ASGITransport(app=app)
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        scheduled: list[UUID] = []
+
+        class FakeRunner:
+            def __init__(self, **_: object) -> None:
+                pass
+
+            async def run(self, execution_id: UUID) -> None:
+                scheduled.append(execution_id)
+                first_started.set()
+                await release_first.wait()
+
+        monkeypatch.setattr("maestro.presentation.api.LocalExecutionRunner", FakeRunner)
+        try:
+            execution_id = uuid4()
+            _schedule_execution_run(app, context, execution_id)
+            await first_started.wait()
+            _schedule_execution_run(app, context, execution_id)
+
+            async with AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                response = await client.post(
+                    "/api/v1/admin/clear-data",
+                    json={"confirm": "CLEAR"},
+                )
+
+            assert response.status_code == 200
+            assert scheduled == [execution_id]
+            assert app.state.maestro_execution_tasks == {}
+            assert app.state.maestro_execution_run_pending == set()
+        finally:
+            release_first.set()
+            await _drain_execution_tasks(app)
+            context.close()
+
+    asyncio.run(scenario())
+
+
+def test_execution_rerun_action_clones_execution_as_new_draft(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        settings = api_settings(tmp_path)
+        context = create_api_context(settings)
+        app = create_app(settings, api_context=context)
+        transport = ASGITransport(app=app)
+        try:
+            project = await create_ready_project(context)
+            spec = execution_spec(project).model_copy(
+                update={
+                    "suspended": True,
+                    "cancellation_requested": True,
+                }
+            )
+            execution = await context.executions.create(
+                Execution.new(name="add-health", spec=spec)
+            )
+
+            async with AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                first = await client.post(
+                    f"/api/v1/executions/{execution.metadata.id}/actions/rerun",
+                    json={
+                        "resourceVersion": execution.metadata.resource_version,
+                        "actor": "local-user",
+                        "requestSource": "web-ui",
+                    },
+                )
+                second = await client.post(
+                    f"/api/v1/executions/{execution.metadata.id}/actions/rerun",
+                    json={
+                        "resourceVersion": execution.metadata.resource_version,
+                        "actor": "local-user",
+                        "requestSource": "web-ui",
+                    },
+                )
+
+                assert first.status_code == 201
+                assert second.status_code == 201
+                first_payload = first.json()
+                second_payload = second.json()
+                assert first_payload["metadata"]["name"] == "add-health-rerun"
+                assert second_payload["metadata"]["name"] == "add-health-rerun-2"
+                assert first_payload["status"]["phase"] == ExecutionPhase.DRAFT
+                assert first_payload["spec"]["goal"] == execution.spec.goal.model_dump(
+                    mode="json",
+                    by_alias=True,
+                )
+                assert first_payload["spec"]["suspended"] is False
+                assert first_payload["spec"]["cancellationRequested"] is False
         finally:
             context.close()
 
@@ -1069,6 +1246,7 @@ def test_openapi_generation_includes_v1_paths(tmp_path: Path) -> None:
     assert "/api/v1/admin/clear-data" in payload["paths"]
     assert "/api/v1/executions/{resource_id}/actions/start" in payload["paths"]
     assert "/api/v1/executions/{resource_id}/actions/run" in payload["paths"]
+    assert "/api/v1/executions/{resource_id}/actions/rerun" in payload["paths"]
     assert "/api/v1/executions/{resource_id}/actions/respond" in payload["paths"]
     assert "/api/v1/approvals/{resource_id}/actions/approve" in payload["paths"]
 
@@ -1098,6 +1276,8 @@ def test_ui_shell_and_assets_render_browser_surface(tmp_path: Path) -> None:
                 assert "New Execution" in shell.text
                 assert 'id="run-execution"' in shell.text
                 assert "Start" in shell.text
+                assert 'id="rerun-execution"' in shell.text
+                assert "Rerun" in shell.text
                 assert "Approvals" in shell.text
                 assert 'role="alert"' in shell.text
                 assert "<label>" in shell.text
@@ -1110,6 +1290,7 @@ def test_ui_shell_and_assets_render_browser_surface(tmp_path: Path) -> None:
                 assert "/admin/clear-data" in script.text
                 assert "createProject" in script.text
                 assert "runExecution" in script.text
+                assert "rerunExecution" in script.text
                 assert "submitUserInput" in script.text
                 assert "captureUserInputDraft" in script.text
                 assert "hasActiveFormControl" in script.text
@@ -1117,6 +1298,7 @@ def test_ui_shell_and_assets_render_browser_surface(tmp_path: Path) -> None:
                 assert "ExecutionCancellationRequested" in script.text
                 assert 'request("/projects"' in script.text
                 assert "/actions/run" in script.text
+                assert "/actions/rerun" in script.text
                 assert "/actions/respond" in script.text
                 assert "startAutoRefresh" in script.text
                 assert "ExecutionRunStarted" in script.text

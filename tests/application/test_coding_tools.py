@@ -191,6 +191,45 @@ def test_filesystem_tools_persist_artifacts_and_events(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_repository_ref_path_alias_resolves_to_workspace_root(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        harness = make_harness(tmp_path)
+        workspace_root = tmp_path / "workspace"
+        (workspace_root / "README.md").write_text("hello\n")
+
+        listed = await harness.runtime.execute_tool(
+            "list-files",
+            {"path": str(workspace_root / "backend"), "recursive": False},
+            workspace=harness.workspace,
+            work_item=harness.work_item,
+            granted_capabilities=("filesystem.read",),
+        )
+        written = await harness.runtime.execute_tool(
+            "write-file",
+            {"path": "backend/app.py", "content": "print('ok')\n"},
+            workspace=harness.workspace,
+            work_item=harness.work_item,
+            granted_capabilities=("filesystem.write",),
+        )
+        read = await harness.runtime.execute_tool(
+            "read-file",
+            {"path": "backend/app.py"},
+            workspace=harness.workspace,
+            work_item=harness.work_item,
+            granted_capabilities=("filesystem.read",),
+        )
+
+        assert listed.status == ToolExecutionStatus.SUCCEEDED
+        assert listed.output["path"] == "."
+        assert written.output["path"] == "app.py"
+        assert read.output["content"] == "print('ok')\n"
+        assert (workspace_root / "app.py").read_text() == "print('ok')\n"
+        assert not (workspace_root / "backend").exists()
+        harness.close()
+
+    asyncio.run(scenario())
+
+
 def test_capability_denial_persists_without_writing(tmp_path: Path) -> None:
     async def scenario() -> None:
         harness = make_harness(tmp_path)
@@ -344,6 +383,84 @@ def test_run_command_caps_timeout_and_truncates_output(tmp_path: Path) -> None:
         assert result.truncated is True
         assert len(result.output["stdout"].encode("utf-8")) <= 20
         assert provider.command_requests[0].timeout_seconds == 3
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_run_command_accepts_string_command_as_argv(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        harness = make_harness(tmp_path)
+        provider = RecordingWorkspaceProvider()
+
+        result = await harness.runtime.execute_tool(
+            "run-command",
+            {
+                "command": "pytest -q",
+            },
+            workspace=harness.workspace,
+            work_item=harness.work_item,
+            workspace_provider=provider,
+            granted_capabilities=("shell.execute.test",),
+        )
+
+        assert result.status == ToolExecutionStatus.SUCCEEDED
+        assert provider.command_requests[0].command == ("pytest", "-q")
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_run_command_treats_path_only_request_as_directory_listing(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        harness = make_harness(tmp_path)
+        provider = RecordingWorkspaceProvider()
+
+        result = await harness.runtime.execute_tool(
+            "run-command",
+            {
+                "path": ".",
+                "timeoutSeconds": 2,
+            },
+            workspace=harness.workspace,
+            work_item=harness.work_item,
+            workspace_provider=provider,
+            granted_capabilities=("shell.execute.test",),
+        )
+
+        assert result.status == ToolExecutionStatus.SUCCEEDED
+        assert result.output["command"] == ("ls", "-la")
+        assert result.output["cwd"] == "."
+        assert provider.command_requests[0].command == ("ls", "-la")
+        assert provider.command_requests[0].cwd == tmp_path / "workspace"
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_run_command_denies_long_running_server_commands(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        harness = make_harness(tmp_path)
+        provider = RecordingWorkspaceProvider()
+
+        result = await harness.runtime.execute_tool(
+            "run-command",
+            {
+                "command": "uvicorn main:app --reload",
+            },
+            workspace=harness.workspace,
+            work_item=harness.work_item,
+            workspace_provider=provider,
+            granted_capabilities=("shell.execute.test",),
+        )
+
+        assert result.status == ToolExecutionStatus.DENIED
+        assert result.message.startswith(
+            "run-command is for short verification commands"
+        )
+        assert provider.command_requests == []
         harness.close()
 
     asyncio.run(scenario())

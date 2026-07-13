@@ -101,7 +101,13 @@ from maestro.domain.providers import (
     ToolLoopRequest,
     ToolLoopResult,
 )
-from maestro.domain.resources import BaseResource, Condition, ConditionStatus, utc_now
+from maestro.domain.resources import (
+    BaseResource,
+    Condition,
+    ConditionStatus,
+    ResourceReference,
+    utc_now,
+)
 from maestro.domain.reviews import (
     Review,
     ReviewArtifactReference,
@@ -323,6 +329,30 @@ async def approve_plan_status(repository: SQLitePlanRepository, plan: Plan) -> P
             validation=PlanValidationResult(valid=True),
             approvedBy="sashka",
             approvedAt=utc_now(),
+        ),
+        expected_resource_version=waiting.metadata.resource_version,
+    )
+
+
+async def reject_plan_status(repository: SQLitePlanRepository, plan: Plan) -> Plan:
+    waiting = await repository.update_status(
+        plan.metadata.id,
+        PlanStatus(
+            observedGeneration=plan.metadata.generation,
+            phase=PlanPhase.WAITING_FOR_APPROVAL,
+            validation=PlanValidationResult(valid=True),
+        ),
+        expected_resource_version=plan.metadata.resource_version,
+    )
+    return await repository.update_status(
+        waiting.metadata.id,
+        PlanStatus(
+            observedGeneration=waiting.metadata.generation,
+            phase=PlanPhase.REJECTED,
+            validation=PlanValidationResult(valid=True),
+            rejectedBy="sashka",
+            rejectedAt=utc_now(),
+            rejectionReason="Needs a concrete implementation step",
         ),
         expected_resource_version=waiting.metadata.resource_version,
     )
@@ -1066,6 +1096,236 @@ def test_execution_controller_advances_only_with_evidence_and_cancels_safely(
         work_item_repository.close()
         review_repository.close()
         approval_repository.close()
+
+    asyncio.run(scenario())
+
+
+def test_execution_controller_replans_after_plan_rejection() -> None:
+    async def scenario() -> None:
+        execution_repository = SQLiteExecutionRepository(":memory:")
+        plan_repository = SQLitePlanRepository(":memory:")
+        try:
+            created_execution = await execution_repository.create(execution())
+            planning = await execution_repository.update_status(
+                created_execution.metadata.id,
+                created_execution.status.model_copy(
+                    update={"phase": ExecutionPhase.PLANNING}
+                ),
+                expected_resource_version=created_execution.metadata.resource_version,
+            )
+            waiting = await execution_repository.update_status(
+                planning.metadata.id,
+                planning.status.model_copy(
+                    update={"phase": ExecutionPhase.WAITING_FOR_PLAN_APPROVAL}
+                ),
+                expected_resource_version=planning.metadata.resource_version,
+            )
+            plan = await plan_repository.create(
+                Plan.new(
+                    name="plan-1",
+                    spec=plan_spec(created_execution.metadata.id),
+                )
+            )
+            await reject_plan_status(plan_repository, plan)
+            controller = ExecutionController(
+                execution_repository,
+                plan_repository=plan_repository,
+            )
+
+            await controller.reconcile(context_for(waiting))
+
+            replanning = await execution_repository.get(created_execution.metadata.id)
+            assert replanning.status.phase == ExecutionPhase.PLANNING
+            assert replanning.status.approved_plan_ref is None
+            assert condition(replanning, "Reconciled").reason == "PlanRejected"
+        finally:
+            execution_repository.close()
+            plan_repository.close()
+
+    asyncio.run(scenario())
+
+
+def test_execution_controller_waits_for_failed_work_item_retry() -> None:
+    async def scenario() -> None:
+        execution_repository = SQLiteExecutionRepository(":memory:")
+        work_item_repository = SQLiteWorkItemRepository(":memory:")
+        try:
+            execution = await execution_repository.create(
+                Execution.new(
+                    name="add-health-endpoint",
+                    spec=execution_spec(),
+                )
+            )
+            plan_id = uuid4()
+            planning = await execution_repository.update_status(
+                execution.metadata.id,
+                execution.status.model_copy(update={"phase": ExecutionPhase.PLANNING}),
+                expected_resource_version=execution.metadata.resource_version,
+            )
+            waiting = await execution_repository.update_status(
+                planning.metadata.id,
+                planning.status.model_copy(
+                    update={"phase": ExecutionPhase.WAITING_FOR_PLAN_APPROVAL}
+                ),
+                expected_resource_version=planning.metadata.resource_version,
+            )
+            preparing = await execution_repository.update_status(
+                waiting.metadata.id,
+                waiting.status.model_copy(
+                    update={"phase": ExecutionPhase.PREPARING_WORKSPACE}
+                ),
+                expected_resource_version=waiting.metadata.resource_version,
+            )
+            executing = await execution_repository.update_status(
+                preparing.metadata.id,
+                preparing.status.model_copy(
+                    update={
+                        "phase": ExecutionPhase.EXECUTING,
+                        "approved_plan_ref": ResourceReference(
+                            kind="Plan",
+                            id=plan_id,
+                            name="plan-1",
+                        ),
+                    }
+                ),
+                expected_resource_version=preparing.metadata.resource_version,
+            )
+            work_item = await work_item_repository.create(
+                WorkItem.new(
+                    name="add-health",
+                    spec=work_item_spec(execution.metadata.id, plan_id),
+                )
+            )
+            ready = await move_work_item(
+                work_item_repository, work_item, WorkItemPhase.READY
+            )
+            scheduled = await move_work_item(
+                work_item_repository,
+                ready,
+                WorkItemPhase.SCHEDULED,
+                attempt=1,
+            )
+            running = await move_work_item(
+                work_item_repository,
+                scheduled,
+                WorkItemPhase.RUNNING,
+                attempt=1,
+            )
+            await move_work_item(
+                work_item_repository,
+                running,
+                WorkItemPhase.FAILED,
+                attempt=1,
+            )
+            controller = ExecutionController(
+                execution_repository,
+                work_item_repository=work_item_repository,
+            )
+
+            await controller.reconcile(context_for(executing))
+
+            retrying = await execution_repository.get(execution.metadata.id)
+            assert retrying.status.phase == ExecutionPhase.EXECUTING
+            assert retrying.status.approved_plan_ref is not None
+            assert retrying.status.iteration.coding == 0
+            assert condition(retrying, "Reconciled").reason == (
+                "WaitingForWorkItemRetry"
+            )
+        finally:
+            execution_repository.close()
+            work_item_repository.close()
+
+    asyncio.run(scenario())
+
+
+def test_execution_controller_fails_after_work_item_retry_exhausted() -> None:
+    async def scenario() -> None:
+        execution_repository = SQLiteExecutionRepository(":memory:")
+        work_item_repository = SQLiteWorkItemRepository(":memory:")
+        try:
+            execution = await execution_repository.create(
+                Execution.new(
+                    name="add-health-endpoint",
+                    spec=execution_spec().model_copy(
+                        update={"limits": ExecutionLimits(maxCodingIterations=1)}
+                    ),
+                )
+            )
+            executing = await execution_repository.update_status(
+                execution.metadata.id,
+                execution.status.model_copy(update={"phase": ExecutionPhase.PLANNING}),
+                expected_resource_version=execution.metadata.resource_version,
+            )
+            executing = await execution_repository.update_status(
+                executing.metadata.id,
+                executing.status.model_copy(
+                    update={"phase": ExecutionPhase.WAITING_FOR_PLAN_APPROVAL}
+                ),
+                expected_resource_version=executing.metadata.resource_version,
+            )
+            executing = await execution_repository.update_status(
+                executing.metadata.id,
+                executing.status.model_copy(
+                    update={"phase": ExecutionPhase.PREPARING_WORKSPACE}
+                ),
+                expected_resource_version=executing.metadata.resource_version,
+            )
+            executing = await execution_repository.update_status(
+                executing.metadata.id,
+                executing.status.model_copy(
+                    update={
+                        "phase": ExecutionPhase.EXECUTING,
+                        "iteration": execution.status.iteration.model_copy(
+                            update={"coding": 1}
+                        ),
+                    }
+                ),
+                expected_resource_version=executing.metadata.resource_version,
+            )
+            work_item = await work_item_repository.create(
+                WorkItem.new(
+                    name="add-health",
+                    spec=work_item_spec(
+                        execution.metadata.id,
+                        uuid4(),
+                        max_attempts=1,
+                    ),
+                )
+            )
+            ready = await move_work_item(
+                work_item_repository, work_item, WorkItemPhase.READY
+            )
+            scheduled = await move_work_item(
+                work_item_repository,
+                ready,
+                WorkItemPhase.SCHEDULED,
+                attempt=1,
+            )
+            running = await move_work_item(
+                work_item_repository,
+                scheduled,
+                WorkItemPhase.RUNNING,
+                attempt=1,
+            )
+            await move_work_item(
+                work_item_repository,
+                running,
+                WorkItemPhase.FAILED,
+                attempt=1,
+            )
+            controller = ExecutionController(
+                execution_repository,
+                work_item_repository=work_item_repository,
+            )
+
+            await controller.reconcile(context_for(executing))
+
+            failed = await execution_repository.get(execution.metadata.id)
+            assert failed.status.phase == ExecutionPhase.FAILED
+            assert condition(failed, "Reconciled").reason == "WorkItemFailed"
+        finally:
+            execution_repository.close()
+            work_item_repository.close()
 
     asyncio.run(scenario())
 

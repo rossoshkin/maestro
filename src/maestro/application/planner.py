@@ -83,11 +83,20 @@ Produce a compact JSON object that conforms to the supplied schema.
 Do not modify files, execute commands, approve plans, or schedule agents.
 Create small independently verifiable work items.
 Ask blocking questions only when the goal cannot safely proceed without them.
+Before presenting a plan, review it against every goal acceptance criterion.
+For implementation goals, do not propose inspection-only plans such as only
+checking whether a dependency is installed; include concrete coding work that
+creates or changes the requested files and behavior.
+Do not create a separate coding WorkItem just to verify all acceptance criteria;
+Maestro verifies and reviews independently after implementation. Put focused
+verification commands on the implementation WorkItem when useful.
 Use lower-case hyphen-separated IDs such as add-health, never underscores.
 Use the coding role for implementation work items.
 Use roleRef.version v1alpha1 for implementation work items.
 Only request known workspace capabilities: filesystem.read, filesystem.write,
 shell.execute.test, git.status, git.diff. Omit capabilities when unsure.
+For implementation items that create or modify files, request filesystem.read and
+filesystem.write. Add shell.execute.test, git.status, and git.diff when useful.
 """
 PLANNER_DEFAULT_WORK_ITEM_ROLE = "coding"
 PLANNER_DEFAULT_ROLE_VERSION = "v1alpha1"
@@ -328,6 +337,7 @@ class PlannerRuntime:
                     execution=execution,
                     project=project,
                 )
+                _validate_planner_output_quality(planner_output, execution)
                 result = await self._handle_valid_output(
                     execution,
                     project,
@@ -779,6 +789,145 @@ def _planner_output_from_provider_payload(
         return PlannerOutput.model_validate(repaired_payload)
 
 
+def _validate_planner_output_quality(
+    output: PlannerOutput,
+    execution: Execution,
+) -> None:
+    blocking_questions = tuple(
+        question for question in output.questions if question.blocking
+    )
+    if blocking_questions:
+        return
+    if not output.work_items:
+        raise ValueError("PlanQualityInvalid: plan must include at least one WorkItem")
+
+    goal_text = _execution_goal_text(execution)
+    work_item_texts = tuple(
+        _planner_work_item_text(work_item) for work_item in output.work_items
+    )
+    combined_work_text = " ".join(work_item_texts)
+    issues: list[str] = []
+
+    if _text_requires_implementation(goal_text):
+        implementation_items = tuple(
+            work_item
+            for work_item, work_text in zip(
+                output.work_items, work_item_texts, strict=True
+            )
+            if work_item.role_ref.name == PLANNER_DEFAULT_WORK_ITEM_ROLE
+            and _text_requires_implementation(work_text)
+            and not _text_is_inspection_only(work_text)
+        )
+        if not implementation_items:
+            issues.append(
+                "implementation goal needs at least one concrete coding WorkItem "
+                "that creates or modifies files"
+            )
+
+    for criterion in execution.spec.goal.acceptance_criteria:
+        if _criterion_is_prohibitive(criterion):
+            continue
+        missing = _missing_goal_criterion_topics(criterion, combined_work_text)
+        if missing:
+            issues.append(
+                f"acceptance criterion is not covered: {criterion!r} "
+                f"(missing topics: {', '.join(missing)})"
+            )
+
+    if issues:
+        raise ValueError("PlanQualityInvalid: " + "; ".join(issues))
+
+
+def _execution_goal_text(execution: Execution) -> str:
+    return " ".join(
+        (
+            execution.spec.goal.summary,
+            execution.spec.goal.description,
+            " ".join(execution.spec.goal.constraints),
+            " ".join(execution.spec.goal.acceptance_criteria),
+        )
+    ).lower()
+
+
+def _planner_work_item_text(work_item: PlannerWorkItemOutput) -> str:
+    return " ".join(
+        (
+            work_item.id,
+            work_item.title,
+            work_item.objective,
+            " ".join(work_item.acceptance_criteria),
+            " ".join(work_item.constraints),
+        )
+    ).lower()
+
+
+def _text_requires_implementation(text: str) -> bool:
+    return any(
+        token in text
+        for token in (
+            "add",
+            "build",
+            "create",
+            "implement",
+            "modify",
+            "update",
+            "write",
+        )
+    )
+
+
+def _text_is_inspection_only(text: str) -> bool:
+    if _text_requires_implementation(text):
+        return False
+    return any(
+        phrase in text
+        for phrase in (
+            "check if",
+            "check whether",
+            "confirm",
+            "inspect",
+            "look for",
+            "verify installed",
+        )
+    )
+
+
+def _criterion_is_prohibitive(criterion: str) -> bool:
+    text = criterion.lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "avoid ",
+            "do not ",
+            "don't ",
+            "must not ",
+            "no ",
+            "not add",
+            "not include",
+            "should not ",
+            "without ",
+        )
+    )
+
+
+def _missing_goal_criterion_topics(criterion: str, plan_text: str) -> tuple[str, ...]:
+    criterion_text = criterion.lower()
+    topics = {
+        "health": ("health", "/health"),
+        "test": ("test", "pytest", "automated"),
+        "readme": ("readme", "instructions", "run instructions"),
+        "database": ("database", "db"),
+        "authentication": ("authentication", "auth"),
+    }
+    missing: list[str] = []
+    for topic, markers in topics.items():
+        if any(marker in criterion_text for marker in markers) and not any(
+            marker in plan_text for marker in markers
+        ):
+            missing.append(topic)
+    return tuple(missing)
+
+
 def _normalize_planner_output_payload(
     payload: Any,
     *,
@@ -855,6 +1004,7 @@ def _normalize_planner_work_items(
         _normalize_planner_work_item_repository(work_item, repository_ids)
         _normalize_planner_work_item_dependencies(work_item, id_map)
         _normalize_planner_work_item_capabilities(work_item)
+    _infer_planner_work_item_dependencies(work_items)
 
 
 def _normalize_planner_work_item_role(
@@ -961,6 +1111,65 @@ def _coerce_capability_name(value: str) -> str:
     return text
 
 
+def _infer_planner_work_item_dependencies(
+    work_items: list[Any] | tuple[Any, ...],
+) -> None:
+    implementation_ids: list[str] = []
+    for work_item in work_items:
+        if not isinstance(work_item, dict):
+            continue
+        if _is_implementation_work_item(work_item):
+            item_id = work_item.get("id")
+            if isinstance(item_id, str):
+                implementation_ids.append(item_id)
+            continue
+        if not _is_follow_up_work_item(work_item):
+            continue
+        depends_on = work_item.get("dependsOn")
+        if isinstance(depends_on, tuple | list) and depends_on:
+            continue
+        item_id = work_item.get("id")
+        inferred = tuple(
+            dependency
+            for dependency in implementation_ids
+            if isinstance(item_id, str) and dependency != item_id
+        )
+        if inferred:
+            work_item["dependsOn"] = inferred
+
+
+def _is_implementation_work_item(work_item: dict[str, Any]) -> bool:
+    role_ref = work_item.get("roleRef")
+    if not isinstance(role_ref, dict) or role_ref.get("name") != "coding":
+        return False
+    return not _is_follow_up_work_item(work_item)
+
+
+def _is_follow_up_work_item(work_item: dict[str, Any]) -> bool:
+    haystack = " ".join(
+        str(value).lower()
+        for value in (
+            work_item.get("id", ""),
+            work_item.get("title", ""),
+            work_item.get("objective", ""),
+            " ".join(str(item) for item in work_item.get("acceptanceCriteria", ())),
+        )
+    )
+    return any(
+        token in haystack
+        for token in (
+            "test",
+            "verify",
+            "verification",
+            "review",
+            "readme",
+            "documentation",
+            "docs",
+            "instructions",
+        )
+    )
+
+
 def _coerce_resource_name(value: Any, *, fallback: str) -> str:
     if isinstance(value, str):
         normalized = value.strip().lower()
@@ -994,6 +1203,7 @@ def _plan_spec_from_output(
     *,
     version: int,
 ) -> PlanSpec:
+    guardrail_constraints = _execution_guardrail_constraints(execution)
     return PlanSpec(
         executionRef=PlanExecutionReference(
             id=execution.metadata.id,
@@ -1018,7 +1228,9 @@ def _plan_spec_from_output(
                 repositoryRef=work_item.repository_ref,
                 objective=work_item.objective,
                 contextRefs=work_item.context_refs,
-                constraints=work_item.constraints,
+                constraints=tuple(
+                    dict.fromkeys((*work_item.constraints, *guardrail_constraints))
+                ),
                 acceptanceCriteria=work_item.acceptance_criteria,
                 verification=PlanWorkItemVerification(
                     commands=work_item.verification.commands
@@ -1029,6 +1241,18 @@ def _plan_spec_from_output(
             for work_item in output.work_items
         ),
     )
+
+
+def _execution_guardrail_constraints(execution: Execution) -> tuple[str, ...]:
+    guardrails = (
+        *execution.spec.goal.constraints,
+        *(
+            criterion
+            for criterion in execution.spec.goal.acceptance_criteria
+            if _criterion_is_prohibitive(criterion)
+        ),
+    )
+    return tuple(dict.fromkeys(guardrails))
 
 
 def _ensure_planner_capabilities(

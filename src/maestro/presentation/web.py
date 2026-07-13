@@ -181,6 +181,9 @@ HTML_SHELL = """<!doctype html>
               <button id="run-execution" type="button" class="primary-button">
                 Start
               </button>
+              <button id="rerun-execution" type="button">
+                Rerun
+              </button>
               <button id="cancel-execution" type="button" class="danger-button">
                 Cancel
               </button>
@@ -849,6 +852,7 @@ function bindElements() {
     "execution-title",
     "execution-overview",
     "run-execution",
+    "rerun-execution",
     "cancel-execution",
     "user-input-panel",
     "user-input-form",
@@ -883,6 +887,9 @@ function bindActions() {
   });
   elements["run-execution"].addEventListener("click", () => {
     void runExecution();
+  });
+  elements["rerun-execution"].addEventListener("click", () => {
+    void rerunExecution();
   });
   elements["cancel-execution"].addEventListener("click", () => {
     void cancelExecution();
@@ -1128,6 +1135,7 @@ function renderExecutionOverview() {
   elements["run-execution"].disabled = !execution || isTerminalExecution(execution);
   elements["run-execution"].textContent =
     execution && execution.status.phase === "Draft" ? "Start" : "Run";
+  elements["rerun-execution"].disabled = !execution;
   elements["cancel-execution"].disabled = !execution || !canCancelExecution(execution);
   if (!execution) {
     elements["execution-overview"].innerHTML = empty("No execution selected.");
@@ -1490,6 +1498,30 @@ async function runExecution() {
       }
     );
     state.selectedExecutionId = started.metadata.id;
+    await loadAll({force: true});
+  } catch (error) {
+    showError(error);
+  }
+}
+
+async function rerunExecution() {
+  const execution = selectedExecution();
+  if (!execution) {
+    return;
+  }
+  try {
+    const rerun = await request(
+      `/executions/${execution.metadata.id}/actions/rerun`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          resourceVersion: execution.metadata.resourceVersion,
+          actor: "local-user",
+          requestSource: "web-ui",
+        }),
+      }
+    );
+    state.selectedExecutionId = rerun.metadata.id;
     await loadAll({force: true});
   } catch (error) {
     showError(error);

@@ -201,6 +201,48 @@ def valid_planner_output() -> dict[str, Any]:
     }
 
 
+def mvp_planner_output_without_negative_guardrail() -> dict[str, Any]:
+    """Build MVP-style output that omits negative criteria from WorkItems."""
+
+    return {
+        "summary": "Create a minimal FastAPI application.",
+        "assumptions": (),
+        "questions": (),
+        "risks": (),
+        "workItems": (
+            {
+                "id": "add-health",
+                "title": "Add health endpoint",
+                "roleRef": {"name": "coding", "version": "v1alpha1"},
+                "repositoryRef": "backend",
+                "objective": ('Implement GET /health returning {"status":"ok"}.'),
+                "acceptanceCriteria": ('GET /health returns {"status":"ok"}.',),
+                "requestedCapabilities": ("filesystem.read", "filesystem.write"),
+            },
+            {
+                "id": "add-test",
+                "title": "Add automated test",
+                "roleRef": {"name": "coding", "version": "v1alpha1"},
+                "repositoryRef": "backend",
+                "objective": "Add one automated test for GET /health.",
+                "acceptanceCriteria": ("One automated test is added.",),
+                "dependsOn": ("add-health",),
+                "requestedCapabilities": ("filesystem.read", "filesystem.write"),
+            },
+            {
+                "id": "add-readme",
+                "title": "Add README instructions",
+                "roleRef": {"name": "coding", "version": "v1alpha1"},
+                "repositoryRef": "backend",
+                "objective": "Add README run instructions.",
+                "acceptanceCriteria": ("README contains run instructions.",),
+                "dependsOn": ("add-health",),
+                "requestedCapabilities": ("filesystem.read", "filesystem.write"),
+            },
+        ),
+    }
+
+
 def blocking_question_output() -> dict[str, Any]:
     """Build Planner output that asks for user input before planning."""
 
@@ -228,6 +270,29 @@ def invalid_planner_output() -> dict[str, Any]:
         "questions": (),
         "risks": (),
         "workItems": (),
+    }
+
+
+def inspection_only_planner_output() -> dict[str, Any]:
+    """Build a semantically weak plan for an implementation goal."""
+
+    return {
+        "summary": "Check whether FastAPI is available.",
+        "assumptions": (),
+        "questions": (),
+        "risks": (),
+        "workItems": (
+            {
+                "id": "check-fastapi-installed",
+                "title": "Check FastAPI installation",
+                "roleRef": {"name": "coding", "version": "v1alpha1"},
+                "repositoryRef": "backend",
+                "objective": "Check if FastAPI is installed.",
+                "acceptanceCriteria": ("FastAPI availability is known.",),
+                "dependsOn": (),
+                "requestedCapabilities": ("filesystem.read",),
+            },
+        ),
     }
 
 
@@ -275,6 +340,62 @@ def recoverable_planner_output() -> dict[str, Any]:
                 "acceptanceCriteria": ("No database or authentication is added.",),
                 "dependsOn": ("create_fastapi_app", "add_automated_test"),
                 "requestedCapabilities": ("coding_review",),
+            },
+        ),
+    }
+
+
+def omitted_dependency_planner_output() -> dict[str, Any]:
+    """Build Planner output that omits obvious follow-up dependencies."""
+
+    return {
+        "summary": "Create a minimal FastAPI application.",
+        "assumptions": (),
+        "questions": (),
+        "risks": (),
+        "workItems": (
+            {
+                "id": "add-health-endpoint",
+                "title": "Add /health endpoint",
+                "roleRef": {"name": "coding", "version": "v1alpha1"},
+                "repositoryRef": "backend",
+                "objective": (
+                    'Implement a GET /health endpoint that returns {"status":"ok"}.'
+                ),
+                "acceptanceCriteria": ('GET /health returns {"status":"ok"}.',),
+                "dependsOn": (),
+                "requestedCapabilities": (
+                    "filesystem.read",
+                    "filesystem.write",
+                    "shell.execute.test",
+                ),
+            },
+            {
+                "id": "add-automated-test",
+                "title": "Add one automated test",
+                "roleRef": {"name": "coding", "version": "v1alpha1"},
+                "repositoryRef": "backend",
+                "objective": "Create an automated test for the /health endpoint.",
+                "acceptanceCriteria": ("One automated test is added.",),
+                "dependsOn": (),
+                "requestedCapabilities": (
+                    "filesystem.read",
+                    "filesystem.write",
+                    "shell.execute.test",
+                ),
+            },
+            {
+                "id": "add-readme-instructions",
+                "title": "Add README instructions",
+                "roleRef": {"name": "coding", "version": "v1alpha1"},
+                "repositoryRef": "backend",
+                "objective": (
+                    "Create a README file with run instructions for the FastAPI "
+                    "application."
+                ),
+                "acceptanceCriteria": ("README contains run instructions.",),
+                "dependsOn": (),
+                "requestedCapabilities": ("filesystem.read", "filesystem.write"),
             },
         ),
     }
@@ -414,6 +535,38 @@ def test_planner_normalizes_recoverable_model_output(
     asyncio.run(scenario())
 
 
+def test_planner_infers_follow_up_dependencies_when_model_omits_them(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        provider_runtime = RecordingProvider((omitted_dependency_planner_output(),))
+        harness = await make_harness(tmp_path)
+
+        result = await harness.runtime.invoke_planner(
+            harness.execution.metadata.id,
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=provider_runtime,
+            granted_capabilities=("filesystem.read",),
+        )
+
+        plans = await harness.plans.list_by_execution(harness.execution.metadata.id)
+        plan = plans[0]
+
+        assert result.plan_ref is not None
+        assert tuple(item.id for item in plan.spec.work_items) == (
+            "add-health-endpoint",
+            "add-automated-test",
+            "add-readme-instructions",
+        )
+        assert plan.spec.work_items[0].depends_on == ()
+        assert plan.spec.work_items[1].depends_on == ("add-health-endpoint",)
+        assert plan.spec.work_items[2].depends_on == ("add-health-endpoint",)
+        harness.close()
+
+    asyncio.run(scenario())
+
+
 def test_planner_retries_once_with_repair_prompt_after_invalid_output(
     tmp_path: Path,
 ) -> None:
@@ -459,6 +612,35 @@ def test_planner_retries_once_with_repair_prompt_after_invalid_output(
             )
             == 1
         )
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_planner_repairs_semantically_weak_plan_before_creating_plan(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        provider_runtime = RecordingProvider(
+            (inspection_only_planner_output(), valid_planner_output())
+        )
+
+        result = await harness.runtime.invoke_planner(
+            harness.execution.metadata.id,
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=provider_runtime,
+            granted_capabilities=("filesystem.read",),
+        )
+
+        plans = await harness.plans.list_by_execution(harness.execution.metadata.id)
+
+        assert result.repair_attempted is True
+        assert len(provider_runtime.calls) == 2
+        assert "PlanQualityInvalid" in provider_runtime.calls[1].messages[1].content
+        assert len(plans) == 1
+        assert plans[0].spec.work_items[0].id == "add-health"
         harness.close()
 
     asyncio.run(scenario())
@@ -510,6 +692,85 @@ def test_planner_raises_after_one_repair_attempt_for_invalid_output(
                 for artifact in artifacts
             )
             == 2
+        )
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_planner_rejects_repeated_semantically_weak_plan(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        provider_runtime = RecordingProvider(
+            (inspection_only_planner_output(), inspection_only_planner_output())
+        )
+
+        with pytest.raises(PlannerOutputError):
+            await harness.runtime.invoke_planner(
+                harness.execution.metadata.id,
+                agent=agent_resource(),
+                provider=provider_resource(),
+                runtime=provider_runtime,
+                granted_capabilities=("filesystem.read",),
+            )
+
+        plans = await harness.plans.list_by_execution(harness.execution.metadata.id)
+        invocation = (
+            await harness.role_invocations.list_by_execution(
+                harness.execution.metadata.id
+            )
+        )[0]
+
+        assert plans == ()
+        assert invocation.status.phase == RoleInvocationPhase.FAILED
+        assert invocation.status.failure is not None
+        assert invocation.status.failure.reason == "PlannerOutputInvalid"
+        assert "PlanQualityInvalid" in invocation.status.failure.message
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_planner_accepts_negative_acceptance_criteria_as_guardrails(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        goal = Goal(
+            summary="Create a minimal FastAPI application.",
+            description=(
+                'GET /health returns {"status":"ok"}, add one automated '
+                "test, add README instructions, and do not add a database or "
+                "authentication."
+            ),
+            acceptanceCriteria=(
+                'GET /health returns {"status":"ok"}.',
+                "One automated test is added.",
+                "README contains run instructions.",
+                "No database or authentication is added.",
+            ),
+        )
+        harness = await make_harness(tmp_path, goal=goal)
+        provider_runtime = RecordingProvider(
+            (mvp_planner_output_without_negative_guardrail(),)
+        )
+
+        result = await harness.runtime.invoke_planner(
+            harness.execution.metadata.id,
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=provider_runtime,
+            granted_capabilities=("filesystem.read",),
+        )
+
+        plan = await harness.plans.get(result.plan_ref.id)
+
+        assert len(provider_runtime.calls) == 1
+        assert plan.spec.work_items
+        assert all(
+            "No database or authentication is added." in work_item.constraints
+            for work_item in plan.spec.work_items
         )
         harness.close()
 
@@ -643,6 +904,7 @@ async def make_harness(
     tmp_path: Path,
     *,
     publisher: RecordingPublisher | None = None,
+    goal: Goal | None = None,
 ) -> PlannerHarness:
     projects = SQLiteProjectRepository(":memory:")
     executions = SQLiteExecutionRepository(":memory:")
@@ -662,7 +924,11 @@ async def make_harness(
         event_publisher=publisher,
     )
     project = await projects.create(project_resource(tmp_path))
-    execution = await executions.create(execution_resource(project))
+    execution = await executions.create(
+        execution_resource_with_goal(project, goal)
+        if goal is not None
+        else execution_resource(project)
+    )
     planning_execution = await executions.update_status(
         execution.metadata.id,
         ExecutionStatus(
@@ -716,6 +982,17 @@ def project_resource(tmp_path: Path) -> Project:
 
 
 def execution_resource(project: Project) -> Execution:
+    return execution_resource_with_goal(
+        project,
+        Goal(
+            summary="Add health endpoint",
+            description="Create GET /health.",
+            acceptanceCriteria=("GET /health returns 200.",),
+        ),
+    )
+
+
+def execution_resource_with_goal(project: Project, goal: Goal) -> Execution:
     return Execution.new(
         name="add-health-endpoint",
         spec=ExecutionSpec(
@@ -723,11 +1000,7 @@ def execution_resource(project: Project) -> Execution:
                 id=project.metadata.id,
                 name=project.metadata.name,
             ),
-            goal=Goal(
-                summary="Add health endpoint",
-                description="Create GET /health.",
-                acceptanceCriteria=("GET /health returns 200.",),
-            ),
+            goal=goal,
             workflowRef=ExecutionWorkflowReference(
                 name="software-delivery",
                 version="v1alpha1",

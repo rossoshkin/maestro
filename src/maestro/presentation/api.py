@@ -314,6 +314,7 @@ def create_app(
     api.state.maestro_api_context = api_context
     api.state.maestro_auto_run_enabled = api_context is None
     api.state.maestro_execution_tasks = {}
+    api.state.maestro_execution_run_pending = set()
 
     _install_exception_handlers(api)
 
@@ -551,6 +552,19 @@ def _v1_router() -> APIRouter:
             context,
             execution.metadata.id,
         )
+        return _dump_resource(execution)
+
+    @router.post(
+        "/executions/{resource_id}/actions/rerun",
+        status_code=status.HTTP_201_CREATED,
+        tags=["executions"],
+    )
+    async def rerun_execution(
+        resource_id: UUID,
+        request: ExecutionActionRequest,
+        context: ApiContextDep,
+    ) -> dict[str, Any]:
+        execution = await _rerun_execution_from_browser(resource_id, request, context)
         return _dump_resource(execution)
 
     @router.post("/executions/{resource_id}/actions/respond", tags=["executions"])
@@ -1023,12 +1037,20 @@ ExecutionIdQuery = Annotated[UUID | None, Query(alias="executionId")]
 
 async def _cancel_background_runs(app: FastAPI) -> None:
     tasks = cast(dict[UUID, asyncio.Task[None]], app.state.maestro_execution_tasks)
+    pending = cast(set[UUID], app.state.maestro_execution_run_pending)
     running = tuple(task for task in tasks.values() if not task.done())
+    pending.clear()
     for task in running:
         task.cancel()
     tasks.clear()
     if running:
-        await asyncio.gather(*running, return_exceptions=True)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*running, return_exceptions=True),
+                timeout=2,
+            )
+        except TimeoutError:
+            pass
 
 
 def _clear_sqlite_tables(database_url: str) -> tuple[str, ...]:
@@ -1169,6 +1191,41 @@ async def _run_execution_from_browser(
     return execution
 
 
+async def _rerun_execution_from_browser(
+    resource_id: UUID,
+    request: ExecutionActionRequest,
+    context: ApiContext,
+) -> Execution:
+    execution = await context.executions.get(resource_id)
+    if execution.metadata.resource_version != request.resource_version:
+        raise ResourceConflictError(
+            execution.metadata.id,
+            request.resource_version,
+            execution.metadata.resource_version,
+        )
+
+    existing = await context.executions.list(
+        ResourceSelector(namespace=execution.metadata.namespace)
+    )
+    spec = execution.spec.model_copy(
+        update={
+            "suspended": False,
+            "cancellation_requested": False,
+        }
+    )
+    service = ExecutionService(context.executions, context.projects)
+    return await service.create_execution(
+        name=_rerun_execution_name(
+            execution.metadata.name,
+            execution.metadata.namespace,
+            existing,
+        ),
+        namespace=execution.metadata.namespace,
+        created_by=request.actor,
+        spec=spec,
+    )
+
+
 async def _record_user_input_for_browser(
     resource_id: UUID,
     request: ExecutionUserInputRequest,
@@ -1231,6 +1288,26 @@ async def _record_user_input_for_browser(
     )
 
 
+def _rerun_execution_name(
+    base_name: str,
+    namespace: str,
+    existing: Sequence[Execution],
+) -> ResourceName:
+    existing_names = {execution.metadata.name for execution in existing}
+    for index in range(1, 1000):
+        suffix = "rerun" if index == 1 else f"rerun-{index}"
+        candidate = _name_with_suffix(base_name, suffix)
+        if candidate not in existing_names:
+            return candidate
+    raise ResourceAlreadyExistsError("Execution", namespace, base_name)
+
+
+def _name_with_suffix(base_name: str, suffix: str) -> ResourceName:
+    max_prefix_length = 63 - len(suffix) - 1
+    prefix = base_name[:max_prefix_length].rstrip("-")
+    return f"{prefix}-{suffix}"
+
+
 async def _reconcile_execution_for_browser(
     execution: Execution,
     context: ApiContext,
@@ -1263,10 +1340,13 @@ def _schedule_execution_run(
         return
 
     tasks = cast(dict[UUID, asyncio.Task[None]], app.state.maestro_execution_tasks)
+    pending = cast(set[UUID], app.state.maestro_execution_run_pending)
     existing = tasks.get(execution_id)
     if existing is not None and not existing.done():
+        pending.add(execution_id)
         return
 
+    pending.discard(execution_id)
     runner = LocalExecutionRunner(
         settings=context.settings,
         project_repository=context.projects,
@@ -1288,7 +1368,16 @@ def _schedule_execution_run(
     )
     task = asyncio.create_task(runner.run(execution_id))
     tasks[execution_id] = task
-    task.add_done_callback(lambda completed: tasks.pop(execution_id, None))
+
+    def schedule_pending_run(completed: asyncio.Task[None]) -> None:
+        if tasks.get(execution_id) is completed:
+            tasks.pop(execution_id, None)
+        if execution_id not in pending:
+            return
+        pending.discard(execution_id)
+        _schedule_execution_run(app, context, execution_id)
+
+    task.add_done_callback(schedule_pending_run)
 
 
 def _resource_ref(resource: BaseResource[Any, Any]) -> ResourceReference:

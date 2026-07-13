@@ -102,6 +102,7 @@ from maestro.domain.work_items import (
     WorkItemPhase,
     WorkItemPlanReference,
     WorkItemRepository,
+    WorkItemRetryPolicy,
     WorkItemRoleReference,
     WorkItemSpec,
     WorkItemStatus,
@@ -954,6 +955,16 @@ class ExecutionController:
         await self._mark_waiting(execution, "WaitingForPlan")
 
     async def _reconcile_plan_approval(self, execution: Execution) -> None:
+        rejected_plan = await self._rejected_plan(execution)
+        if rejected_plan is not None:
+            await self._transition_execution(
+                execution,
+                ExecutionPhase.PLANNING,
+                current_step="planning",
+                approved_plan_ref=None,
+                condition_reason="PlanRejected",
+            )
+            return
         approved_plan = await self._approved_plan(execution)
         if approved_plan is None:
             await self._mark_waiting(execution, "WaitingForPlanApproval")
@@ -1011,9 +1022,16 @@ class ExecutionController:
         if not work_items:
             await self._mark_waiting(execution, "WaitingForWorkItems")
             return
-        if any(
-            work_item.status.phase == WorkItemPhase.FAILED for work_item in work_items
-        ):
+        work_items = _work_items_for_current_plan(execution, work_items)
+        failed_work_items = tuple(
+            work_item
+            for work_item in work_items
+            if work_item.status.phase == WorkItemPhase.FAILED
+        )
+        if failed_work_items:
+            if any(_work_item_can_retry(work_item) for work_item in failed_work_items):
+                await self._mark_waiting(execution, "WaitingForWorkItemRetry")
+                return
             await self._transition_execution(
                 execution,
                 ExecutionPhase.FAILED,
@@ -1502,6 +1520,17 @@ class ExecutionController:
             execution.metadata.id
         )
 
+    async def _rejected_plan(self, execution: Execution) -> Plan | None:
+        if self._plan_repository is None:
+            return None
+        plans = await self._plan_repository.list_by_execution(execution.metadata.id)
+        if not plans:
+            return None
+        latest = max(plans, key=lambda plan: plan.spec.version)
+        if latest.status.phase != PlanPhase.REJECTED:
+            return None
+        return latest
+
     async def _has_plan_waiting_for_approval(self, execution: Execution) -> bool:
         if self._plan_repository is None:
             return False
@@ -1621,6 +1650,7 @@ def _work_item_spec_from_plan(
         acceptanceCriteria=proposal.acceptance_criteria,
         verification=WorkItemVerificationSpec(commands=proposal.verification.commands),
         requestedCapabilities=proposal.requested_capabilities,
+        retryPolicy=WorkItemRetryPolicy(maxAttempts=2),
     )
 
 
@@ -1721,6 +1751,24 @@ def _merge_work_items(
     by_id = {item.metadata.id: item for item in work_items}
     by_id[work_item.metadata.id] = work_item
     return tuple(by_id.values())
+
+
+def _work_items_for_current_plan(
+    execution: Execution,
+    work_items: tuple[WorkItem, ...],
+) -> tuple[WorkItem, ...]:
+    if execution.status.approved_plan_ref is None:
+        return work_items
+    current = tuple(
+        work_item
+        for work_item in work_items
+        if work_item.spec.plan_ref.id == execution.status.approved_plan_ref.id
+    )
+    return current or work_items
+
+
+def _work_item_can_retry(work_item: WorkItem) -> bool:
+    return work_item.status.attempt < work_item.spec.retry_policy.max_attempts
 
 
 def _approval_targets_review(approval: Approval, review: Review) -> bool:

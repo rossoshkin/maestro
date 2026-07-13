@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import shlex
 from collections.abc import Callable
 from enum import StrEnum
 from time import monotonic
 from typing import Any
 from uuid import UUID
 
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, field_validator
 
 from maestro.application.artifacts import ArtifactService
 from maestro.application.controllers import observe_generation, with_condition
@@ -74,19 +75,38 @@ CODING_RUNTIME = "coding-runtime"
 CODING_PROMPT_TEMPLATE = """You are Maestro's Coding Role.
 
 Work only inside the assigned Workspace using the provided tools.
+The assigned Workspace root is already the repository checkout. Do not append
+workspace.repositoryRef as a subdirectory; use "." or direct paths such as
+"main.py", "README.md", or "tests/test_health.py".
 Use exactly the granted Capabilities and do not request prohibited operations.
+Granted Capabilities are explicit authorization to use the matching tools; do
+not ask the user whether you have permission to use a granted Capability.
 Inspect relevant files before editing. Keep changes focused on the Work Item.
+Use write-file or edit-file to create or change files.
+If no relevant file exists and the Work Item asks you to add, create,
+implement, update, or write something, create an appropriate file instead of
+asking whether to create one.
+Use run-command only for short verification commands; do not use it to create
+source files or start long-running servers.
 When no more tools are needed, return only a compact JSON object matching the
 supplied Coding output schema.
 If a script must be executable, write it with executable=true or use run-command
 to chmod it, then run the script when shell.execute.test is granted.
 Do not return blocked for issues you can resolve with the granted tools.
+Return blocked only when missing external input prevents progress; include at
+least one actionable question.
+Do not use commandsRequested to ask Maestro to run tools; request tool calls
+instead, then report only commands you actually requested through tools.
 Do not claim tests passed unless you observed command output through tools.
 Do not mark the Work Item verified; Maestro verifies independently.
 """
 DEFAULT_CODING_MAX_STEPS = 20
 DEFAULT_CODING_MAX_DURATION_SECONDS = 900
 DEFAULT_CODING_MAX_OUTPUT_BYTES = 64 * 1024
+DEFAULT_CODING_MAX_OUTPUT_REPAIRS = 2
+DEFAULT_CODING_MAX_REPEATED_TOOL_CALLS = 3
+DEFAULT_CODING_MAX_TOOL_LOOP_REPAIRS = 1
+DEFAULT_CODING_MAX_TOOL_RESULT_ECHO_REPAIRS = 2
 CODING_DENIED_CAPABILITIES = (
     "filesystem.read.outside-workspace",
     "git.push",
@@ -128,6 +148,15 @@ class CodingCommandRequest(MaestroModel):
 
     command: str = Field(min_length=1)
     purpose: str = ""
+
+    @field_validator("command", mode="before")
+    @classmethod
+    def normalize_command(cls, value: Any) -> Any:
+        """Accept argv-shaped command reports from local models."""
+
+        if isinstance(value, list | tuple):
+            return shlex.join(tuple(str(part) for part in value))
+        return value
 
 
 class LiteralRuntimeStatus(StrEnum):
@@ -279,6 +308,11 @@ class CodingRuntime:
         response_artifacts: list[Artifact] = []
         tool_artifact_refs: list[ResourceReference] = []
         tool_call_count = 0
+        output_repair_count = 0
+        last_tool_call_signature: str | None = None
+        repeated_tool_call_count = 0
+        tool_loop_repair_count = 0
+        tool_result_echo_repair_count = 0
         started = self._clock()
 
         while True:
@@ -349,6 +383,15 @@ class CodingRuntime:
             try:
                 tool_calls = _tool_calls_from_output(loop_result.output)
             except (ValidationError, ValueError) as error:
+                if output_repair_count < DEFAULT_CODING_MAX_OUTPUT_REPAIRS:
+                    output_repair_count += 1
+                    _append_output_repair_messages(
+                        messages,
+                        loop_result.output,
+                        reason="CodingToolCallsInvalid",
+                        message=str(error),
+                    )
+                    continue
                 return await self._finish_failed(
                     running_work_item,
                     running_invocation,
@@ -373,6 +416,38 @@ class CodingRuntime:
                         tool_artifact_refs=tuple(tool_artifact_refs),
                         reason="CodingStepLimitExceeded",
                         message="Coding Agent requested more tool calls than allowed",
+                        status=LiteralRuntimeStatus.STEP_LIMIT_EXCEEDED,
+                    )
+                tool_call_signature = _tool_call_signature(tool_calls)
+                if tool_call_signature == last_tool_call_signature:
+                    repeated_tool_call_count += 1
+                else:
+                    last_tool_call_signature = tool_call_signature
+                    repeated_tool_call_count = 1
+                if repeated_tool_call_count > DEFAULT_CODING_MAX_REPEATED_TOOL_CALLS:
+                    message = (
+                        "Coding Agent repeated the same tool call without progress: "
+                        f"{tool_call_signature}"
+                    )
+                    if tool_loop_repair_count < DEFAULT_CODING_MAX_TOOL_LOOP_REPAIRS:
+                        tool_loop_repair_count += 1
+                        repeated_tool_call_count = 0
+                        _append_tool_loop_repair_messages(
+                            messages,
+                            tool_calls,
+                            message=message,
+                        )
+                        continue
+                    return await self._finish_failed(
+                        running_work_item,
+                        running_invocation,
+                        provider=provider,
+                        model=agent.spec.model,
+                        prompt_artifact=prompt_artifact,
+                        response_artifact=response_artifact,
+                        tool_artifact_refs=tuple(tool_artifact_refs),
+                        reason="CodingToolLoopStalled",
+                        message=message,
                         status=LiteralRuntimeStatus.STEP_LIMIT_EXCEEDED,
                     )
                 messages.append(
@@ -408,11 +483,49 @@ class CodingRuntime:
                     )
                 continue
 
+            if _looks_like_tool_result_echo(loop_result.output):
+                message = (
+                    "Coding Agent returned a tool result as final output instead "
+                    "of continuing the Work Item"
+                )
+                if (
+                    tool_result_echo_repair_count
+                    < DEFAULT_CODING_MAX_TOOL_RESULT_ECHO_REPAIRS
+                ):
+                    tool_result_echo_repair_count += 1
+                    _append_tool_result_echo_repair_messages(
+                        messages,
+                        loop_result.output,
+                        message=message,
+                    )
+                    continue
+                return await self._finish_failed(
+                    running_work_item,
+                    running_invocation,
+                    provider=provider,
+                    model=agent.spec.model,
+                    prompt_artifact=prompt_artifact,
+                    response_artifact=response_artifact,
+                    tool_artifact_refs=tuple(tool_artifact_refs),
+                    reason="CodingOutputInvalid",
+                    message=message,
+                    status=LiteralRuntimeStatus.INVALID_OUTPUT,
+                )
+
             try:
                 coding_output = CodingOutput.model_validate(
-                    _coding_output_candidate(loop_result.output)
+                    _coding_output_candidate(loop_result.output, running_work_item)
                 )
             except ValidationError as error:
+                if output_repair_count < DEFAULT_CODING_MAX_OUTPUT_REPAIRS:
+                    output_repair_count += 1
+                    _append_output_repair_messages(
+                        messages,
+                        loop_result.output,
+                        reason="CodingOutputInvalid",
+                        message=str(error),
+                    )
+                    continue
                 return await self._finish_failed(
                     running_work_item,
                     running_invocation,
@@ -429,6 +542,16 @@ class CodingRuntime:
                 coding_output.status == CodingOutputStatus.COMPLETED
                 and coding_output.questions
             ):
+                message = "completed CodingOutput must not include questions"
+                if output_repair_count < DEFAULT_CODING_MAX_OUTPUT_REPAIRS:
+                    output_repair_count += 1
+                    _append_output_repair_messages(
+                        messages,
+                        loop_result.output,
+                        reason="CodingOutputInvalid",
+                        message=message,
+                    )
+                    continue
                 return await self._finish_failed(
                     running_work_item,
                     running_invocation,
@@ -438,7 +561,100 @@ class CodingRuntime:
                     response_artifact=response_artifact,
                     tool_artifact_refs=tuple(tool_artifact_refs),
                     reason="CodingOutputInvalid",
-                    message="completed CodingOutput must not include questions",
+                    message=message,
+                    status=LiteralRuntimeStatus.INVALID_OUTPUT,
+                )
+            if (
+                coding_output.status == CodingOutputStatus.BLOCKED
+                and _blocked_question_is_answered_by_capabilities(
+                    coding_output,
+                    granted_capabilities,
+                )
+            ):
+                message = (
+                    "blocked CodingOutput asks whether a granted Capability is "
+                    "permitted; granted Capabilities are already authorization "
+                    "to use the matching tools"
+                )
+                if output_repair_count < DEFAULT_CODING_MAX_OUTPUT_REPAIRS:
+                    output_repair_count += 1
+                    _append_output_repair_messages(
+                        messages,
+                        loop_result.output,
+                        reason="CodingOutputInvalid",
+                        message=message,
+                    )
+                    continue
+                return await self._finish_failed(
+                    running_work_item,
+                    running_invocation,
+                    provider=provider,
+                    model=agent.spec.model,
+                    prompt_artifact=prompt_artifact,
+                    response_artifact=response_artifact,
+                    tool_artifact_refs=tuple(tool_artifact_refs),
+                    reason="CodingOutputInvalid",
+                    message=message,
+                    status=LiteralRuntimeStatus.INVALID_OUTPUT,
+                )
+            if (
+                coding_output.status == CodingOutputStatus.BLOCKED
+                and _blocked_question_is_answered_by_work_item(
+                    coding_output,
+                    running_work_item,
+                    granted_capabilities,
+                )
+            ):
+                message = (
+                    "blocked CodingOutput asks for confirmation to perform "
+                    "implementation work already required by the WorkItem; "
+                    "continue using the granted file-editing tools"
+                )
+                if output_repair_count < DEFAULT_CODING_MAX_OUTPUT_REPAIRS:
+                    output_repair_count += 1
+                    _append_output_repair_messages(
+                        messages,
+                        loop_result.output,
+                        reason="CodingOutputInvalid",
+                        message=message,
+                    )
+                    continue
+                return await self._finish_failed(
+                    running_work_item,
+                    running_invocation,
+                    provider=provider,
+                    model=agent.spec.model,
+                    prompt_artifact=prompt_artifact,
+                    response_artifact=response_artifact,
+                    tool_artifact_refs=tuple(tool_artifact_refs),
+                    reason="CodingOutputInvalid",
+                    message=message,
+                    status=LiteralRuntimeStatus.INVALID_OUTPUT,
+                )
+            if (
+                coding_output.status == CodingOutputStatus.BLOCKED
+                and not coding_output.questions
+            ):
+                message = "blocked CodingOutput must include at least one question"
+                if output_repair_count < DEFAULT_CODING_MAX_OUTPUT_REPAIRS:
+                    output_repair_count += 1
+                    _append_output_repair_messages(
+                        messages,
+                        loop_result.output,
+                        reason="CodingOutputInvalid",
+                        message=message,
+                    )
+                    continue
+                return await self._finish_failed(
+                    running_work_item,
+                    running_invocation,
+                    provider=provider,
+                    model=agent.spec.model,
+                    prompt_artifact=prompt_artifact,
+                    response_artifact=response_artifact,
+                    tool_artifact_refs=tuple(tool_artifact_refs),
+                    reason="CodingOutputInvalid",
+                    message=message,
                     status=LiteralRuntimeStatus.INVALID_OUTPUT,
                 )
 
@@ -446,6 +662,36 @@ class CodingRuntime:
                 workspace,
                 workspace_provider,
             )
+            if (
+                coding_output.status == CodingOutputStatus.COMPLETED
+                and not observed_changes
+                and _work_item_requires_workspace_change(running_work_item)
+            ):
+                message = (
+                    "completed CodingOutput must produce observed workspace changes "
+                    "for this WorkItem"
+                )
+                if output_repair_count < DEFAULT_CODING_MAX_OUTPUT_REPAIRS:
+                    output_repair_count += 1
+                    _append_output_repair_messages(
+                        messages,
+                        loop_result.output,
+                        reason="CodingOutputInvalid",
+                        message=message,
+                    )
+                    continue
+                return await self._finish_failed(
+                    running_work_item,
+                    running_invocation,
+                    provider=provider,
+                    model=agent.spec.model,
+                    prompt_artifact=prompt_artifact,
+                    response_artifact=response_artifact,
+                    tool_artifact_refs=tuple(tool_artifact_refs),
+                    reason="CodingOutputInvalid",
+                    message=message,
+                    status=LiteralRuntimeStatus.INVALID_OUTPUT,
+                )
             diff_artifact = await self._create_diff_artifact(
                 running_invocation,
                 running_work_item,
@@ -730,6 +976,7 @@ class CodingRuntime:
                 "phase": WorkItemPhase.RUNNING,
                 "attempt": work_item.status.attempt + 1,
                 "started_at": work_item.status.started_at or utc_now(),
+                "completed_at": None,
             }
         )
         status = with_condition(
@@ -1110,6 +1357,10 @@ def build_coding_input(
             "root": str(workspace.status.path) if workspace.status.path else "",
             "repositoryRef": workspace.spec.repository_ref,
             "baseRevision": workspace.spec.base_revision,
+            "pathConvention": (
+                "workspace.root is already the repository checkout; "
+                "repositoryRef is an alias, not a required path prefix"
+            ),
         },
         "context": context or {},
         "capabilities": {
@@ -1152,6 +1403,267 @@ def _coding_prompt(
     return _json_text(prompt)
 
 
+def _append_output_repair_messages(
+    messages: list[ProviderMessage],
+    output: dict[str, Any],
+    *,
+    reason: str,
+    message: str,
+) -> None:
+    messages.append(
+        ProviderMessage(
+            role=ProviderMessageRole.ASSISTANT,
+            content=_json_text(output),
+        )
+    )
+    messages.append(
+        ProviderMessage(
+            role=ProviderMessageRole.USER,
+            content=_coding_output_repair_prompt(reason, message),
+        )
+    )
+
+
+def _append_tool_loop_repair_messages(
+    messages: list[ProviderMessage],
+    tool_calls: tuple[CodingToolCall, ...],
+    *,
+    message: str,
+) -> None:
+    messages.append(
+        ProviderMessage(
+            role=ProviderMessageRole.ASSISTANT,
+            content=_json_text(
+                {
+                    "toolCalls": tuple(
+                        call.model_dump(mode="json", by_alias=True)
+                        for call in tool_calls
+                    )
+                }
+            ),
+        )
+    )
+    messages.append(
+        ProviderMessage(
+            role=ProviderMessageRole.USER,
+            content=_coding_tool_loop_repair_prompt(message),
+        )
+    )
+
+
+def _append_tool_result_echo_repair_messages(
+    messages: list[ProviderMessage],
+    output: dict[str, Any],
+    *,
+    message: str,
+) -> None:
+    messages.append(
+        ProviderMessage(
+            role=ProviderMessageRole.ASSISTANT,
+            content=_json_text(output),
+        )
+    )
+    messages.append(
+        ProviderMessage(
+            role=ProviderMessageRole.USER,
+            content=_coding_tool_result_echo_repair_prompt(message),
+        )
+    )
+
+
+def _coding_output_repair_prompt(reason: str, message: str) -> str:
+    return _json_text(
+        {
+            "instructions": (
+                "Your previous response did not complete the Work Item. Continue "
+                "the same Work Item. If implementation is possible with the "
+                "granted tools, request tool calls now. Use write-file or "
+                "edit-file for file changes. Use run-command only for short "
+                "verification commands. Granted Capabilities are already "
+                "authorization to use the matching tools; do not ask whether "
+                "you have permission to read, write, or run commands when the "
+                "matching Capability is granted. Do not ask for information "
+                "that can be inferred from the Work Item objective or "
+                "acceptance criteria. If no relevant file exists and the Work "
+                "Item asks you to add, create, implement, update, or write "
+                "something, create an appropriate file instead of asking "
+                "whether to create one. "
+                "Return final CodingOutput JSON only after tool work is done. "
+                "If truly blocked by missing external input, return status "
+                "blocked with a summary and at least one actionable question."
+            ),
+            "reason": reason,
+            "message": message,
+        }
+    )
+
+
+def _coding_tool_result_echo_repair_prompt(message: str) -> str:
+    return _json_text(
+        {
+            "instructions": (
+                "Your previous response copied a tool result instead of "
+                "continuing the Work Item. Treat that result as observation. "
+                "Continue now by requesting a useful next tool call, especially "
+                "write-file or edit-file for implementation changes. If the "
+                "Workspace has no relevant source files and the Work Item asks "
+                "you to add, create, implement, update, or write something, "
+                "create the appropriate file. Return final CodingOutput JSON "
+                "only after the required file changes are done."
+            ),
+            "message": message,
+        }
+    )
+
+
+def _coding_tool_loop_repair_prompt(message: str) -> str:
+    return _json_text(
+        {
+            "instructions": (
+                "Your previous response repeated a tool call whose result was "
+                "already available. Do not inspect the same files again unless "
+                "new evidence requires it. Continue the Work Item by requesting "
+                "a different useful tool call, such as write-file or edit-file "
+                "for file changes, or return final CodingOutput JSON if the "
+                "work is complete. If truly blocked by missing external input, "
+                "return status blocked with a summary and at least one "
+                "actionable question."
+            ),
+            "message": message,
+        }
+    )
+
+
+def _work_item_requires_workspace_change(work_item: WorkItem) -> bool:
+    text = " ".join(
+        (
+            work_item.metadata.name,
+            work_item.spec.plan_work_item_id,
+            work_item.spec.objective,
+            " ".join(work_item.spec.acceptance_criteria),
+        )
+    ).lower()
+    return any(
+        token in text
+        for token in (
+            "add",
+            "create",
+            "delete",
+            "implement",
+            "modify",
+            "remove",
+            "update",
+            "write",
+        )
+    )
+
+
+def _blocked_question_is_answered_by_capabilities(
+    output: CodingOutput,
+    granted_capabilities: tuple[CapabilityName, ...],
+) -> bool:
+    question_text = " ".join(output.questions).lower()
+    if not any(token in question_text for token in ("permission", "allowed")):
+        return False
+
+    granted = set(granted_capabilities)
+    asks_about_filesystem_write = any(
+        token in question_text
+        for token in ("create", "directory", "directories", "edit", "file", "write")
+    )
+    if asks_about_filesystem_write and "filesystem.write" in granted:
+        return True
+
+    asks_about_filesystem_read = any(
+        token in question_text for token in ("inspect", "list", "read")
+    )
+    if asks_about_filesystem_read and "filesystem.read" in granted:
+        return True
+
+    asks_about_commands = any(
+        token in question_text for token in ("command", "execute", "run", "test")
+    )
+    return asks_about_commands and any(
+        capability.startswith("shell.execute") for capability in granted
+    )
+
+
+def _blocked_question_is_answered_by_work_item(
+    output: CodingOutput,
+    work_item: WorkItem,
+    granted_capabilities: tuple[CapabilityName, ...],
+) -> bool:
+    if not _work_item_requires_workspace_change(work_item):
+        return False
+    if not any(
+        capability in granted_capabilities
+        for capability in ("filesystem.write", "filesystem.edit")
+    ):
+        return False
+
+    blocked_text = " ".join(
+        (
+            output.summary,
+            " ".join(output.questions),
+            " ".join(output.remaining_issues),
+        )
+    ).lower()
+    if not blocked_text:
+        return False
+
+    asks_for_implementation_confirmation = any(
+        phrase in blocked_text
+        for phrase in (
+            "do you want",
+            "should i",
+            "would you like",
+            "please confirm",
+        )
+    ) and any(
+        token in blocked_text
+        for token in (
+            "add",
+            "create",
+            "edit",
+            "file",
+            "implement",
+            "modify",
+            "update",
+            "write",
+        )
+    )
+    if asks_for_implementation_confirmation:
+        return True
+
+    workspace_is_empty_or_missing_files = any(
+        phrase in blocked_text
+        for phrase in (
+            "empty workspace",
+            "no files found",
+            "no relevant files",
+            "no source files",
+        )
+    )
+    return workspace_is_empty_or_missing_files and any(
+        token
+        in " ".join(
+            (
+                work_item.metadata.name,
+                work_item.spec.plan_work_item_id,
+                work_item.spec.objective,
+                " ".join(work_item.spec.acceptance_criteria),
+            )
+        ).lower()
+        for token in ("add", "create", "implement", "update", "write")
+    )
+
+
+def _tool_call_signature(tool_calls: tuple[CodingToolCall, ...]) -> str:
+    return _json_text(
+        tuple(call.model_dump(mode="json", by_alias=True) for call in tool_calls)
+    )
+
+
 def _tool_calls_from_output(output: dict[str, Any]) -> tuple[CodingToolCall, ...]:
     raw_calls: Any
     if _looks_like_single_tool_call(output):
@@ -1179,11 +1691,97 @@ def _looks_like_single_tool_call(output: dict[str, Any]) -> bool:
     )
 
 
-def _coding_output_candidate(output: dict[str, Any]) -> dict[str, Any]:
+def _looks_like_tool_result_echo(output: dict[str, Any]) -> bool:
+    candidate = output.get("content")
+    if not (isinstance(candidate, dict) and set(output) == {"content"}):
+        candidate = output
+    if not isinstance(candidate, dict):
+        return False
+    if any(
+        key in candidate
+        for key in (
+            "changedFiles",
+            "commandsRequested",
+            "questions",
+            "remainingIssues",
+            "status",
+            "summary",
+            "toolCalls",
+        )
+    ):
+        return False
+    if {"artifactRef", "requiredCapability", "toolName"} <= set(candidate):
+        return True
+    nested = candidate.get("output")
+    if not isinstance(nested, dict):
+        return False
+    return any(
+        key in nested
+        for key in (
+            "bytesWritten",
+            "command",
+            "content",
+            "cwd",
+            "diff",
+            "entries",
+            "error",
+            "exitCode",
+            "occurrencesReplaced",
+            "path",
+            "stderr",
+            "stdout",
+        )
+    )
+
+
+def _coding_output_candidate(
+    output: dict[str, Any],
+    work_item: WorkItem,
+) -> dict[str, Any]:
     content = output.get("content")
     if isinstance(content, dict) and set(output) == {"content"}:
-        return content
-    return output
+        return _normalize_coding_output_candidate(content, work_item)
+    return _normalize_coding_output_candidate(output, work_item)
+
+
+def _normalize_coding_output_candidate(
+    candidate: dict[str, Any],
+    work_item: WorkItem,
+) -> dict[str, Any]:
+    """Tolerate common partial final-output shapes from local models."""
+
+    if (
+        candidate.get("status") == CodingOutputStatus.BLOCKED
+        and "summary" not in candidate
+        and candidate.get("questions")
+    ):
+        normalized = dict(candidate)
+        normalized["summary"] = "Blocked waiting for external input."
+        return normalized
+    if (
+        "status" not in candidate
+        and "summary" not in candidate
+        and candidate.get("commandsRequested")
+        and _work_item_requires_workspace_change(work_item)
+    ):
+        normalized = dict(candidate)
+        normalized["status"] = CodingOutputStatus.COMPLETED
+        normalized["summary"] = (
+            "Implementation changes were produced; command requests were captured "
+            "as follow-up evidence."
+        )
+        return normalized
+    if (
+        "status" not in candidate
+        and isinstance(candidate.get("summary"), str)
+        and candidate["summary"].strip()
+        and not candidate.get("questions")
+        and not candidate.get("remainingIssues")
+    ):
+        normalized = dict(candidate)
+        normalized["status"] = CodingOutputStatus.COMPLETED
+        return normalized
+    return candidate
 
 
 async def _collect_changed_files(

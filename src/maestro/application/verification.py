@@ -360,11 +360,14 @@ class VerificationController:
         request: VerificationRequest,
     ) -> VerificationControllerResult:
         report = VerificationReport(
-            status=VerificationStatus.FAILED,
+            status=VerificationStatus.SKIPPED,
             failureCategory=VerificationFailureCategory.MISSING_COMMANDS,
             request=request,
-            message="No verification commands are configured for this WorkItem",
-            repairAllowed=_repair_allowed(work_item),
+            message=(
+                "No verification commands are configured for this WorkItem; "
+                "command verification was skipped"
+            ),
+            repairAllowed=False,
         )
         return await self._finish(work_item, report)
 
@@ -464,7 +467,7 @@ class VerificationController:
         evidence_refs = _append_refs(command_artifact_refs, (report_ref,))
         phase = (
             WorkItemPhase.SUCCEEDED
-            if report.status == VerificationStatus.PASSED
+            if report.status in {VerificationStatus.PASSED, VerificationStatus.SKIPPED}
             else WorkItemPhase.FAILED
         )
         status = current.status.model_copy(
@@ -488,6 +491,8 @@ class VerificationController:
             condition_status=(
                 ConditionStatus.TRUE
                 if report.status == VerificationStatus.PASSED
+                else ConditionStatus.UNKNOWN
+                if report.status == VerificationStatus.SKIPPED
                 else ConditionStatus.FALSE
             ),
             reason=_condition_reason(report),
@@ -586,11 +591,7 @@ class VerificationController:
         payload = report.model_dump(mode="json", by_alias=True)
         await self._event_publisher.publish(
             EventDraft(
-                type=(
-                    "VerificationCompleted"
-                    if report.status == VerificationStatus.PASSED
-                    else "VerificationFailed"
-                ),
+                type=_event_type(report),
                 producer=VERIFICATION_CONTROLLER,
                 correlationId=(
                     f"verification:{work_item.metadata.id}:{work_item.status.attempt}"
@@ -651,6 +652,8 @@ def _first_failure_category(
 def _condition_reason(report: VerificationReport) -> str:
     if report.status == VerificationStatus.PASSED:
         return "VerificationPassed"
+    if report.status == VerificationStatus.SKIPPED:
+        return "VerificationSkipped"
     if report.failure_category == VerificationFailureCategory.MISSING_COMMANDS:
         return "VerificationCommandsMissing"
     if report.failure_category == VerificationFailureCategory.COMMAND_TIMED_OUT:
@@ -661,6 +664,14 @@ def _condition_reason(report: VerificationReport) -> str:
         return "VerificationWorkspaceUnavailable"
     if report.failure_category == VerificationFailureCategory.INVALID_COMMAND:
         return "VerificationCommandInvalid"
+    return "VerificationFailed"
+
+
+def _event_type(report: VerificationReport) -> str:
+    if report.status == VerificationStatus.PASSED:
+        return "VerificationCompleted"
+    if report.status == VerificationStatus.SKIPPED:
+        return "VerificationSkipped"
     return "VerificationFailed"
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from os import devnull
 from pathlib import Path
 
 from maestro.domain.workspaces import (
@@ -35,15 +36,8 @@ class LocalGitWorktreeProvider:
         self._ensure_not_source_checkout(source_root, target)
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        self._git(
-            source_root,
-            "worktree",
-            "add",
-            "-B",
-            request.workspace.spec.branch_name,
-            str(target),
-            request.workspace.spec.base_revision,
-        )
+        self._prune_worktrees(source_root)
+        self._add_worktree(source_root, request, target)
         revision = self._git(target, "rev-parse", "HEAD")
         return WorkspaceHandle(path=target, observedRevision=revision)
 
@@ -89,7 +83,8 @@ class LocalGitWorktreeProvider:
         path = self._existing_workspace_path(handle)
         staged = self._git(path, "diff", "--cached", "--binary")
         unstaged = self._git(path, "diff", "--binary")
-        parts = tuple(part for part in (staged, unstaged) if part)
+        untracked = self._untracked_diff(path)
+        parts = tuple(part for part in (staged, unstaged, untracked) if part)
         return WorkspaceDiff(text="\n".join(parts))
 
     async def run_command(
@@ -208,6 +203,70 @@ class LocalGitWorktreeProvider:
             return common_git_dir.resolve(strict=True)
         return (path / common_git_dir).resolve(strict=True)
 
+    def _add_worktree(
+        self,
+        source_root: Path,
+        request: WorkspacePrepareRequest,
+        target: Path,
+    ) -> None:
+        try:
+            self._git(
+                source_root,
+                "worktree",
+                "add",
+                "-B",
+                request.workspace.spec.branch_name,
+                str(target),
+                request.workspace.spec.base_revision,
+            )
+        except WorkspaceProviderError as error:
+            if not _is_stale_worktree_registration_error(str(error)):
+                raise
+            self._prune_worktrees(source_root)
+            self._git(
+                source_root,
+                "worktree",
+                "add",
+                "--force",
+                "-B",
+                request.workspace.spec.branch_name,
+                str(target),
+                request.workspace.spec.base_revision,
+            )
+
+    def _prune_worktrees(self, source_root: Path) -> None:
+        self._git(source_root, "worktree", "prune")
+
+    def _untracked_diff(self, path: Path) -> str:
+        names = self._git(path, "ls-files", "--others", "--exclude-standard")
+        parts: list[str] = []
+        for name in names.splitlines():
+            if not name:
+                continue
+            completed = self._run_process(
+                (
+                    self._git_binary,
+                    "-C",
+                    str(path),
+                    "diff",
+                    "--no-index",
+                    "--binary",
+                    "--",
+                    devnull,
+                    name,
+                ),
+                cwd=path,
+                timeout=GIT_TIMEOUT_SECONDS,
+            )
+            if completed.returncode not in {0, 1}:
+                detail = completed.stderr.strip() or completed.stdout.strip()
+                raise WorkspaceProviderError(
+                    detail or "Git untracked diff command failed"
+                )
+            if completed.stdout:
+                parts.append(completed.stdout.strip())
+        return "\n".join(parts)
+
     def _git(self, cwd: Path, *args: str) -> str:
         completed = self._run_checked(
             (self._git_binary, "-C", str(cwd), *args),
@@ -266,3 +325,7 @@ def _is_relative_to(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _is_stale_worktree_registration_error(message: str) -> bool:
+    return "missing but already registered worktree" in message

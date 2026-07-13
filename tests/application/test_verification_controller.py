@@ -269,7 +269,7 @@ def test_verification_controller_enforces_workspace_timeout(tmp_path: Path) -> N
     asyncio.run(scenario())
 
 
-def test_verification_controller_fails_missing_commands(tmp_path: Path) -> None:
+def test_verification_controller_skips_missing_commands(tmp_path: Path) -> None:
     async def scenario() -> None:
         harness = await make_harness(tmp_path, commands=())
 
@@ -281,16 +281,19 @@ def test_verification_controller_fails_missing_commands(tmp_path: Path) -> None:
         report = await harness.report_payload(result.report_artifact_ref.id)
         artifacts = await harness.artifact_list()
 
-        assert result.status == VerificationStatus.FAILED
+        assert result.status == VerificationStatus.SKIPPED
         assert result.command_artifact_refs == ()
-        assert updated.status.phase == WorkItemPhase.FAILED
-        assert (
-            condition(updated, "Verification").reason == "VerificationCommandsMissing"
-        )
+        assert updated.status.phase == WorkItemPhase.SUCCEEDED
+        assert condition(updated, "Verification").reason == "VerificationSkipped"
         assert report["failureCategory"] == VerificationFailureCategory.MISSING_COMMANDS
+        assert report["status"] == "skipped"
+        assert report["repairAllowed"] is False
         assert harness.workspace_provider.command_requests == []
         assert {artifact.spec.artifact_type for artifact in artifacts} == {
             ArtifactType.VERIFICATION_REPORT
+        }
+        assert {event.event_type for event in harness.publisher.events} == {
+            "VerificationSkipped"
         }
         harness.close()
 

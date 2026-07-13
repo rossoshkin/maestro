@@ -600,6 +600,7 @@ async def create_review_artifacts(
 ) -> tuple[Artifact, ...]:
     artifact_specs = (
         (ArtifactType.GIT_DIFF, "text/x-diff", b"diff\n"),
+        (ArtifactType.TOOL_LOG, "application/json", b'{"tool": "run-command"}\n'),
         (ArtifactType.VERIFICATION_REPORT, "application/json", b'{"ok": true}\n'),
     )
     created: list[Artifact] = []
@@ -1083,6 +1084,7 @@ def test_review_repair_workflow_approve_path_creates_exact_final_approval() -> N
         assert reviewing.status.phase == ExecutionPhase.REVIEWING
         assert condition(reviewing, "Reconciled").reason == "WaitingForReview"
         assert len(reviews) == 1
+        assert reviews[0].spec.policy.require_tests is False
         assert {subject.id for subject in reviews[0].spec.subject_refs} == {
             artifact.metadata.id for artifact in artifacts
         }
@@ -1114,6 +1116,45 @@ def test_review_repair_workflow_approve_path_creates_exact_final_approval() -> N
         await harness.controller.reconcile(context_for(waiting))
         completed = await harness.executions.get(harness.execution.metadata.id)
         assert completed.status.phase == ExecutionPhase.COMPLETED
+
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_review_workflow_reviews_all_succeeded_work_item_artifacts() -> None:
+    async def scenario() -> None:
+        harness = await review_workflow_harness()
+        sibling = await harness.work_items.create(
+            WorkItem.new(
+                name="update-readme",
+                spec=work_item_spec(
+                    harness.execution.metadata.id,
+                    harness.work_item.spec.plan_ref.id,
+                    plan_work_item_id="update-readme",
+                ),
+            )
+        )
+        succeeded_sibling = await succeed_work_item(harness.work_items, sibling)
+        sibling_artifacts = await create_review_artifacts(
+            harness.artifacts,
+            harness.execution,
+            succeeded_sibling,
+            suffix="readme",
+        )
+        initial_artifacts = await harness.artifacts.list_by_work_item(
+            harness.work_item.metadata.id
+        )
+
+        await harness.controller.reconcile(context_for(harness.execution))
+        reviews = await harness.reviews.list_by_execution(harness.execution.metadata.id)
+
+        assert len(reviews) == 1
+        assert reviews[0].spec.work_item_ref.id == succeeded_sibling.metadata.id
+        assert {subject.id for subject in reviews[0].spec.subject_refs} == {
+            artifact.metadata.id
+            for artifact in (*initial_artifacts, *sibling_artifacts)
+        }
 
         harness.close()
 
@@ -1206,10 +1247,13 @@ def test_review_repair_workflow_repair_success_reviews_new_artifacts() -> None:
         repair_reviews = await harness.reviews.list_by_work_item(
             succeeded_repair.metadata.id
         )
+        initial_artifacts = await harness.artifacts.list_by_work_item(
+            harness.work_item.metadata.id
+        )
         assert reviewing.status.phase == ExecutionPhase.REVIEWING
         assert len(repair_reviews) == 1
         assert {subject.id for subject in repair_reviews[0].spec.subject_refs} == {
-            artifact.metadata.id for artifact in repair_artifacts
+            artifact.metadata.id for artifact in (*initial_artifacts, *repair_artifacts)
         }
 
         completed_repair_review = await complete_review(

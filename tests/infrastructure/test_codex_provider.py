@@ -15,7 +15,11 @@ from maestro.domain.providers import (
     StructuredGenerationRequest,
     ToolLoopRequest,
 )
-from maestro.infrastructure.providers.codex import CodexProvider, CodexRunResult
+from maestro.infrastructure.providers.codex import (
+    DEFAULT_CODEX_MODEL,
+    CodexProvider,
+    CodexRunResult,
+)
 
 
 class RecordingCodexRunner:
@@ -94,7 +98,7 @@ def test_codex_provider_invokes_exec_read_only_with_schema(tmp_path: Path) -> No
         assert result.output == {"verdict": "Approve", "summary": "ok"}
         assert command[:2] == ("codex", "exec")
         assert command[command.index("--sandbox") + 1] == "read-only"
-        assert command[command.index("--ask-for-approval") + 1] == "never"
+        assert "--ask-for-approval" not in command
         assert "--output-schema" in command
         assert "--output-last-message" in command
         assert command[-1] == "-"
@@ -102,6 +106,110 @@ def test_codex_provider_invokes_exec_read_only_with_schema(tmp_path: Path) -> No
         assert command[command.index("-m") + 1] == "codex-reviewer"
         assert runner.schema_payloads == [{"type": "object"}]
         assert "review only" in runner.stdin[0]
+
+    import asyncio
+
+    asyncio.run(scenario())
+
+
+def test_codex_provider_omits_model_flag_for_cli_default(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runner = RecordingCodexRunner(output={"verdict": "Approve", "summary": "ok"})
+        provider = CodexProvider(
+            executable="codex",
+            models=(DEFAULT_CODEX_MODEL,),
+            working_directory=tmp_path,
+            runner=runner,
+        )
+
+        await provider.generate_structured(
+            StructuredGenerationRequest(
+                model=DEFAULT_CODEX_MODEL,
+                messages=(
+                    ProviderMessage(
+                        role=ProviderMessageRole.USER,
+                        content="Return JSON",
+                    ),
+                ),
+                responseSchema={"type": "object"},
+                timeoutSeconds=7,
+            )
+        )
+
+        command = runner.commands[0]
+
+        assert "-m" not in command
+        assert command[-1] == "-"
+
+    import asyncio
+
+    asyncio.run(scenario())
+
+
+def test_codex_provider_sanitizes_schema_for_structured_outputs(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        runner = RecordingCodexRunner(output={"verdict": "Approve", "findings": []})
+        provider = CodexProvider(
+            executable="codex",
+            models=("codex-reviewer",),
+            working_directory=tmp_path,
+            runner=runner,
+        )
+        schema = {
+            "type": "object",
+            "title": "ReviewOutput",
+            "properties": {
+                "verdict": {"type": "string", "enum": ["Approve"]},
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "minLength": 1},
+                            "file": {
+                                "anyOf": [{"type": "string"}, {"type": "null"}],
+                                "default": None,
+                            },
+                            "line": {
+                                "anyOf": [{"type": "integer"}, {"type": "null"}],
+                                "default": None,
+                                "minimum": 1,
+                            },
+                        },
+                        "required": ["id"],
+                    },
+                },
+            },
+            "required": ["verdict"],
+        }
+
+        await provider.generate_structured(
+            StructuredGenerationRequest(
+                model="codex-reviewer",
+                messages=(
+                    ProviderMessage(
+                        role=ProviderMessageRole.USER,
+                        content="Return JSON",
+                    ),
+                ),
+                responseSchema=schema,
+                timeoutSeconds=7,
+            )
+        )
+
+        sanitized = runner.schema_payloads[0]
+        finding = sanitized["properties"]["findings"]["items"]
+
+        assert sanitized["required"] == ["verdict", "findings"]
+        assert sanitized["additionalProperties"] is False
+        assert "title" not in sanitized
+        assert finding["required"] == ["id", "file", "line"]
+        assert finding["additionalProperties"] is False
+        assert "minLength" not in finding["properties"]["id"]
+        assert "default" not in finding["properties"]["file"]
+        assert "minimum" not in finding["properties"]["line"]
 
     import asyncio
 

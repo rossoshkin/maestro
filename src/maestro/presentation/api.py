@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import shutil
+import sqlite3
+import subprocess
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Annotated, Any, cast
@@ -16,8 +20,23 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from maestro import __version__
 from maestro.application.approvals import ApprovalService
+from maestro.application.controllers import (
+    ReconcileKey,
+    ReconciliationContext,
+    RetryPolicy,
+    observe_generation,
+    with_condition,
+)
 from maestro.application.executions import ExecutionService
-from maestro.application.projects import ProjectService
+from maestro.application.local_runner import LocalExecutionRunner
+from maestro.application.projects import (
+    ProjectService,
+    observe_local_project_repositories,
+)
+from maestro.application.resource_controllers import (
+    ExecutionController,
+    ProjectController,
+)
 from maestro.config import Settings, get_settings
 from maestro.domain.agents import Agent, AgentSpec
 from maestro.domain.approvals import (
@@ -27,7 +46,7 @@ from maestro.domain.approvals import (
     ApprovalDecisionValue,
 )
 from maestro.domain.artifacts import ArtifactStorageError
-from maestro.domain.events import Event
+from maestro.domain.events import Event, EventDraft, EventExecutionReference
 from maestro.domain.exceptions import (
     MaestroDomainError,
     ResourceAlreadyExistsError,
@@ -37,16 +56,28 @@ from maestro.domain.exceptions import (
     ResourceNotFoundError,
     ResourceTransitionError,
 )
-from maestro.domain.executions import ExecutionSpec
-from maestro.domain.projects import ProjectSpec
+from maestro.domain.executions import (
+    TERMINAL_EXECUTION_PHASES,
+    Execution,
+    ExecutionPhase,
+    ExecutionSpec,
+)
+from maestro.domain.projects import Project, ProjectSpec
 from maestro.domain.providers import Provider, ProviderSpec
 from maestro.domain.repositories import ResourceSelector
-from maestro.domain.resources import BaseResource, ResourceName
+from maestro.domain.resources import (
+    BaseResource,
+    ConditionStatus,
+    ResourceName,
+    ResourceReference,
+)
 from maestro.infrastructure.artifacts import LocalArtifactStorage
 from maestro.infrastructure.persistence import (
     SQLiteAgentRepository,
     SQLiteApprovalRepository,
     SQLiteArtifactRepository,
+    SQLiteCapabilityBindingRepository,
+    SQLiteCapabilityRepository,
     SQLiteEventStore,
     SQLiteExecutionRepository,
     SQLitePlanRepository,
@@ -54,7 +85,9 @@ from maestro.infrastructure.persistence import (
     SQLiteProviderRepository,
     SQLiteReviewRepository,
     SQLiteRoleInvocationRepository,
+    SQLiteRoleRepository,
     SQLiteWorkItemRepository,
+    SQLiteWorkspaceRepository,
 )
 from maestro.logging import configure_logging
 from maestro.presentation.web import ui_router
@@ -74,6 +107,24 @@ class ResourceListResponse(BaseModel):
     items: list[dict[str, Any]]
     next_cursor: str | None = Field(default=None, alias="nextCursor")
     total: int = Field(ge=0)
+
+
+class ClearDataRequest(BaseModel):
+    """Destructive local test-data reset request."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    confirm: str
+
+
+class ClearDataResponse(BaseModel):
+    """Summary returned after clearing local test data."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    status: str
+    cleared_tables: tuple[str, ...] = Field(alias="clearedTables")
+    cleared_paths: tuple[str, ...] = Field(alias="clearedPaths")
 
 
 class CreateProjectRequest(BaseModel):
@@ -122,6 +173,28 @@ class ExecutionActionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     resource_version: int = Field(ge=1, alias="resourceVersion")
+    actor: str = Field(default="local-user", min_length=1)
+    request_source: str = Field(default="api", alias="requestSource")
+
+
+class ExecutionUserInputAnswer(BaseModel):
+    """Answer to one Planner question."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    question_id: str = Field(min_length=1, alias="questionId")
+    answer: str = Field(min_length=1)
+
+
+class ExecutionUserInputRequest(BaseModel):
+    """Execution user-input action request body."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    resource_version: int = Field(ge=1, alias="resourceVersion")
+    answers: tuple[ExecutionUserInputAnswer, ...] = Field(min_length=1)
+    actor: str = Field(default="local-user", min_length=1)
+    request_source: str = Field(default="api", alias="requestSource")
 
 
 class CreateProviderRequest(BaseModel):
@@ -189,12 +262,16 @@ class ApiContext:
     executions: SQLiteExecutionRepository
     plans: SQLitePlanRepository
     work_items: SQLiteWorkItemRepository
+    workspaces: SQLiteWorkspaceRepository
     artifacts: SQLiteArtifactRepository
     artifact_storage: LocalArtifactStorage
     reviews: SQLiteReviewRepository
     approvals: SQLiteApprovalRepository
     providers: SQLiteProviderRepository
     agents: SQLiteAgentRepository
+    roles: SQLiteRoleRepository
+    capabilities: SQLiteCapabilityRepository
+    capability_bindings: SQLiteCapabilityBindingRepository
     role_invocations: SQLiteRoleInvocationRepository
     events: SQLiteEventStore
 
@@ -205,11 +282,15 @@ class ApiContext:
         self.executions.close()
         self.plans.close()
         self.work_items.close()
+        self.workspaces.close()
         self.artifacts.close()
         self.reviews.close()
         self.approvals.close()
         self.providers.close()
         self.agents.close()
+        self.roles.close()
+        self.capabilities.close()
+        self.capability_bindings.close()
         self.role_invocations.close()
         self.events.close()
 
@@ -231,6 +312,8 @@ def create_app(
     )
     api.state.maestro_settings = resolved_settings
     api.state.maestro_api_context = api_context
+    api.state.maestro_auto_run_enabled = api_context is None
+    api.state.maestro_execution_tasks = {}
 
     _install_exception_handlers(api)
 
@@ -258,6 +341,32 @@ def _v1_router() -> APIRouter:
     async def describe_api() -> dict[str, str]:
         return {"name": "maestro", "version": __version__}
 
+    @router.post(
+        "/admin/clear-data",
+        response_model=ClearDataResponse,
+        tags=["admin"],
+    )
+    async def clear_local_data(
+        request: ClearDataRequest,
+        context: ApiContextDep,
+        api_request: Request,
+    ) -> ClearDataResponse:
+        if request.confirm != "CLEAR":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='Clear data requires confirm="CLEAR"',
+            )
+        await _cancel_background_runs(api_request.app)
+        projects = await context.projects.list()
+        _prune_project_worktrees(projects)
+        cleared_tables = _clear_sqlite_tables(context.settings.database_url)
+        cleared_paths = _clear_local_data_roots(context.settings)
+        return ClearDataResponse(
+            status="cleared",
+            clearedTables=cleared_tables,
+            clearedPaths=cleared_paths,
+        )
+
     @router.get(
         "/projects",
         response_model=ResourceListResponse,
@@ -272,6 +381,10 @@ def _v1_router() -> APIRouter:
     ) -> ResourceListResponse:
         selector = _selector(namespace, label)
         resources = await context.projects.list(selector)
+        refreshed: list[Project] = []
+        for resource in resources:
+            refreshed.append(await _reconcile_project_for_browser(resource, context))
+        resources = tuple(refreshed)
         return _list_response(resources, limit=limit, cursor=cursor)
 
     @router.post(
@@ -296,6 +409,7 @@ def _v1_router() -> APIRouter:
             created_by=request.created_by,
             spec=request.spec,
         )
+        project = await _reconcile_project_for_browser(project, context)
         return _dump_resource(project)
 
     @router.get("/projects/{resource_id}", tags=["projects"])
@@ -303,7 +417,9 @@ def _v1_router() -> APIRouter:
         resource_id: UUID,
         context: ApiContextDep,
     ) -> dict[str, Any]:
-        return _dump_resource(await context.projects.get(resource_id))
+        project = await context.projects.get(resource_id)
+        project = await _reconcile_project_for_browser(project, context)
+        return _dump_resource(project)
 
     @router.patch("/projects/{resource_id}/spec", tags=["projects"])
     async def update_project_spec(
@@ -323,6 +439,7 @@ def _v1_router() -> APIRouter:
             request.spec,
             expected_resource_version=request.resource_version,
         )
+        project = await _reconcile_project_for_browser(project, context)
         return _dump_resource(project)
 
     @router.get(
@@ -385,11 +502,73 @@ def _v1_router() -> APIRouter:
         resource_id: UUID,
         request: ExecutionActionRequest,
         context: ApiContextDep,
+        api_request: Request,
     ) -> dict[str, Any]:
         service = ExecutionService(context.executions, context.projects)
         execution = await service.request_cancellation(
             resource_id,
             expected_resource_version=request.resource_version,
+        )
+        await _publish_execution_cancellation_requested(
+            execution,
+            request,
+            context,
+        )
+        _schedule_execution_run(
+            api_request.app,
+            context,
+            execution.metadata.id,
+        )
+        return _dump_resource(execution)
+
+    @router.post("/executions/{resource_id}/actions/start", tags=["executions"])
+    async def start_execution(
+        resource_id: UUID,
+        request: ExecutionActionRequest,
+        context: ApiContextDep,
+    ) -> dict[str, Any]:
+        execution = await _start_execution_from_browser(
+            resource_id,
+            request,
+            context,
+        )
+        return _dump_resource(execution)
+
+    @router.post("/executions/{resource_id}/actions/run", tags=["executions"])
+    async def run_execution(
+        resource_id: UUID,
+        request: ExecutionActionRequest,
+        context: ApiContextDep,
+        api_request: Request,
+    ) -> dict[str, Any]:
+        execution = await _run_execution_from_browser(
+            resource_id,
+            request,
+            context,
+        )
+        _schedule_execution_run(
+            api_request.app,
+            context,
+            execution.metadata.id,
+        )
+        return _dump_resource(execution)
+
+    @router.post("/executions/{resource_id}/actions/respond", tags=["executions"])
+    async def respond_to_execution_questions(
+        resource_id: UUID,
+        request: ExecutionUserInputRequest,
+        context: ApiContextDep,
+        api_request: Request,
+    ) -> dict[str, Any]:
+        execution = await _record_user_input_for_browser(
+            resource_id,
+            request,
+            context,
+        )
+        _schedule_execution_run(
+            api_request.app,
+            context,
+            execution.metadata.id,
         )
         return _dump_resource(execution)
 
@@ -649,12 +828,19 @@ def _v1_router() -> APIRouter:
         resource_id: UUID,
         request: ApprovalActionRequest,
         context: ApiContextDep,
+        api_request: Request,
     ) -> dict[str, Any]:
         approval = await _record_approval_decision(
             resource_id,
             request,
             ApprovalDecisionValue.APPROVE,
             context,
+        )
+        await _publish_approval_decision(approval, context)
+        _schedule_execution_run(
+            api_request.app,
+            context,
+            approval.spec.execution_ref.id,
         )
         return _dump_resource(approval)
 
@@ -663,12 +849,19 @@ def _v1_router() -> APIRouter:
         resource_id: UUID,
         request: ApprovalActionRequest,
         context: ApiContextDep,
+        api_request: Request,
     ) -> dict[str, Any]:
         approval = await _record_approval_decision(
             resource_id,
             request,
             ApprovalDecisionValue.REJECT,
             context,
+        )
+        await _publish_approval_decision(approval, context)
+        _schedule_execution_run(
+            api_request.app,
+            context,
+            approval.spec.execution_ref.id,
         )
         return _dump_resource(approval)
 
@@ -788,12 +981,16 @@ def create_api_context(settings: Settings) -> ApiContext:
         executions=SQLiteExecutionRepository(database_path),
         plans=SQLitePlanRepository(database_path),
         work_items=SQLiteWorkItemRepository(database_path),
+        workspaces=SQLiteWorkspaceRepository(database_path),
         artifacts=SQLiteArtifactRepository(database_path),
         artifact_storage=LocalArtifactStorage(settings.artifact_root),
         reviews=SQLiteReviewRepository(database_path),
         approvals=SQLiteApprovalRepository(database_path),
         providers=SQLiteProviderRepository(database_path),
         agents=SQLiteAgentRepository(database_path),
+        roles=SQLiteRoleRepository(database_path),
+        capabilities=SQLiteCapabilityRepository(database_path),
+        capability_bindings=SQLiteCapabilityBindingRepository(database_path),
         role_invocations=SQLiteRoleInvocationRepository(database_path),
         events=SQLiteEventStore(database_path),
     )
@@ -824,6 +1021,284 @@ CursorQuery = Annotated[str | None, Query(description="Opaque pagination cursor.
 ExecutionIdQuery = Annotated[UUID | None, Query(alias="executionId")]
 
 
+async def _cancel_background_runs(app: FastAPI) -> None:
+    tasks = cast(dict[UUID, asyncio.Task[None]], app.state.maestro_execution_tasks)
+    running = tuple(task for task in tasks.values() if not task.done())
+    for task in running:
+        task.cancel()
+    tasks.clear()
+    if running:
+        await asyncio.gather(*running, return_exceptions=True)
+
+
+def _clear_sqlite_tables(database_url: str) -> tuple[str, ...]:
+    database_path = _sqlite_database_path(database_url)
+    if database_path == ":memory:":
+        return ()
+
+    connection = sqlite3.connect(database_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+            ORDER BY name
+            """
+        ).fetchall()
+        tables = tuple(str(row[0]) for row in rows)
+        connection.execute("PRAGMA foreign_keys = OFF")
+        for table in tables:
+            connection.execute(f'DELETE FROM "{table}"')
+        connection.commit()
+        return tables
+    finally:
+        connection.close()
+
+
+def _clear_local_data_roots(settings: Settings) -> tuple[str, ...]:
+    cleared: list[str] = []
+    for path in (settings.artifact_root, settings.workspace_root):
+        if path.exists():
+            shutil.rmtree(path)
+        path.mkdir(parents=True, exist_ok=True)
+        cleared.append(str(path))
+    return tuple(cleared)
+
+
+def _prune_project_worktrees(projects: Sequence[Project]) -> None:
+    git = shutil.which("git")
+    if git is None:
+        return
+
+    repository_paths = {
+        repository.path
+        for project in projects
+        for repository in project.spec.repositories
+    }
+    for path in repository_paths:
+        try:
+            subprocess.run(
+                (git, "-C", str(path), "worktree", "prune"),
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+
+
+async def _reconcile_project_for_browser(
+    project: Project,
+    context: ApiContext,
+) -> Project:
+    controller = ProjectController(
+        context.projects,
+        repository_observer=observe_local_project_repositories,
+    )
+    await controller.reconcile(
+        ReconciliationContext(
+            key=ReconcileKey(kind=project.kind, resource_id=project.metadata.id),
+            controller_name=controller.name,
+            attempt=1,
+            retry_policy=RetryPolicy(),
+        )
+    )
+    return await context.projects.get(project.metadata.id)
+
+
+async def _start_execution_from_browser(
+    resource_id: UUID,
+    request: ExecutionActionRequest,
+    context: ApiContext,
+) -> Execution:
+    execution = await context.executions.get(resource_id)
+    if execution.metadata.resource_version != request.resource_version:
+        raise ResourceConflictError(
+            execution.metadata.id,
+            request.resource_version,
+            execution.metadata.resource_version,
+        )
+    if execution.status.phase != ExecutionPhase.DRAFT:
+        raise ResourceTransitionError(
+            execution.metadata.id,
+            execution.status.phase,
+            ExecutionPhase.PLANNING,
+        )
+
+    await context.events.publish(
+        EventDraft(
+            type="GoalCreated",
+            producer="browser",
+            correlationId=f"GoalCreated:{execution.metadata.id}",
+            executionRef=EventExecutionReference(
+                id=execution.metadata.id,
+                name=execution.metadata.name,
+            ),
+            subjectRef=_resource_ref(execution),
+            payload={
+                "goal": execution.spec.goal.summary,
+                "actor": "local-user",
+            },
+        )
+    )
+    await _reconcile_execution_for_browser(execution, context)
+    return await context.executions.get(execution.metadata.id)
+
+
+async def _run_execution_from_browser(
+    resource_id: UUID,
+    request: ExecutionActionRequest,
+    context: ApiContext,
+) -> Execution:
+    execution = await context.executions.get(resource_id)
+    if execution.metadata.resource_version != request.resource_version:
+        raise ResourceConflictError(
+            execution.metadata.id,
+            request.resource_version,
+            execution.metadata.resource_version,
+        )
+    if execution.status.phase == ExecutionPhase.DRAFT:
+        return await _start_execution_from_browser(resource_id, request, context)
+    if execution.status.phase in TERMINAL_EXECUTION_PHASES:
+        raise ResourceTransitionError(
+            execution.metadata.id,
+            execution.status.phase,
+            "Run",
+        )
+    return execution
+
+
+async def _record_user_input_for_browser(
+    resource_id: UUID,
+    request: ExecutionUserInputRequest,
+    context: ApiContext,
+) -> Execution:
+    execution = await context.executions.get(resource_id)
+    if execution.metadata.resource_version != request.resource_version:
+        raise ResourceConflictError(
+            execution.metadata.id,
+            request.resource_version,
+            execution.metadata.resource_version,
+        )
+    if execution.status.phase != ExecutionPhase.WAITING_FOR_USER_INPUT:
+        raise ResourceTransitionError(
+            execution.metadata.id,
+            execution.status.phase,
+            ExecutionPhase.PLANNING,
+        )
+
+    answer_payload = tuple(
+        answer.model_dump(mode="json", by_alias=True) for answer in request.answers
+    )
+    await context.events.publish(
+        EventDraft(
+            type="UserInputProvided",
+            producer=request.request_source,
+            correlationId=(
+                f"user-input:{execution.metadata.id}:"
+                f"{execution.metadata.resource_version}"
+            ),
+            executionRef=EventExecutionReference(
+                id=execution.metadata.id,
+                name=execution.metadata.name,
+            ),
+            subjectRef=_resource_ref(execution),
+            payload={
+                "actor": request.actor,
+                "answers": answer_payload,
+            },
+        )
+    )
+
+    status_value = execution.status.model_copy(
+        update={
+            "phase": ExecutionPhase.PLANNING,
+            "current_step": "planning",
+        }
+    )
+    status_value = with_condition(
+        execution,
+        observe_generation(execution, status_value),
+        condition_type="Reconciled",
+        condition_status=ConditionStatus.TRUE,
+        reason="UserInputProvided",
+    )
+    return await context.executions.update_status(
+        execution.metadata.id,
+        status_value,
+        expected_resource_version=execution.metadata.resource_version,
+    )
+
+
+async def _reconcile_execution_for_browser(
+    execution: Execution,
+    context: ApiContext,
+) -> None:
+    controller = ExecutionController(
+        context.executions,
+        plan_repository=context.plans,
+        work_item_repository=context.work_items,
+        artifact_repository=context.artifacts,
+        review_repository=context.reviews,
+        approval_repository=context.approvals,
+        event_publisher=context.events,
+    )
+    await controller.reconcile(
+        ReconciliationContext(
+            key=ReconcileKey(kind=execution.kind, resource_id=execution.metadata.id),
+            controller_name=controller.name,
+            attempt=1,
+            retry_policy=RetryPolicy(),
+        )
+    )
+
+
+def _schedule_execution_run(
+    app: FastAPI,
+    context: ApiContext,
+    execution_id: UUID,
+) -> None:
+    if not cast(bool, app.state.maestro_auto_run_enabled):
+        return
+
+    tasks = cast(dict[UUID, asyncio.Task[None]], app.state.maestro_execution_tasks)
+    existing = tasks.get(execution_id)
+    if existing is not None and not existing.done():
+        return
+
+    runner = LocalExecutionRunner(
+        settings=context.settings,
+        project_repository=context.projects,
+        execution_repository=context.executions,
+        plan_repository=context.plans,
+        work_item_repository=context.work_items,
+        workspace_repository=context.workspaces,
+        artifact_repository=context.artifacts,
+        artifact_storage=context.artifact_storage,
+        approval_repository=context.approvals,
+        review_repository=context.reviews,
+        provider_repository=context.providers,
+        agent_repository=context.agents,
+        role_repository=context.roles,
+        capability_repository=context.capabilities,
+        capability_binding_repository=context.capability_bindings,
+        role_invocation_repository=context.role_invocations,
+        event_publisher=context.events,
+    )
+    task = asyncio.create_task(runner.run(execution_id))
+    tasks[execution_id] = task
+    task.add_done_callback(lambda completed: tasks.pop(execution_id, None))
+
+
+def _resource_ref(resource: BaseResource[Any, Any]) -> ResourceReference:
+    return ResourceReference(
+        kind=resource.kind,
+        id=resource.metadata.id,
+        name=resource.metadata.name,
+    )
+
+
 async def _record_approval_decision(
     resource_id: UUID,
     request: ApprovalActionRequest,
@@ -849,6 +1324,59 @@ async def _record_approval_decision(
             requestSource=request.request_source,
         ),
         expected_resource_version=request.resource_version,
+    )
+
+
+async def _publish_approval_decision(
+    approval: Approval,
+    context: ApiContext,
+) -> None:
+    if not approval.status.decisions:
+        return
+    decision = approval.status.decisions[-1]
+    await context.events.publish(
+        EventDraft(
+            type="ApprovalDecided",
+            producer=decision.request_source,
+            correlationId=(
+                f"approval:{approval.metadata.id}:{approval.metadata.resource_version}"
+            ),
+            executionRef=EventExecutionReference(
+                id=approval.spec.execution_ref.id,
+                name=approval.spec.execution_ref.name,
+            ),
+            subjectRef=_resource_ref(approval),
+            payload={
+                "decision": decision.decision,
+                "actor": decision.actor,
+                "comment": decision.comment,
+            },
+        )
+    )
+
+
+async def _publish_execution_cancellation_requested(
+    execution: Execution,
+    request: ExecutionActionRequest,
+    context: ApiContext,
+) -> None:
+    await context.events.publish(
+        EventDraft(
+            type="ExecutionCancellationRequested",
+            producer=request.request_source,
+            correlationId=(
+                f"execution-cancel:{execution.metadata.id}:"
+                f"{execution.metadata.resource_version}"
+            ),
+            executionRef=EventExecutionReference(
+                id=execution.metadata.id,
+                name=execution.metadata.name,
+            ),
+            subjectRef=_resource_ref(execution),
+            payload={
+                "actor": request.actor,
+            },
+        )
     )
 
 

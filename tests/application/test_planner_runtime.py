@@ -15,6 +15,7 @@ import pytest
 from maestro.application.artifacts import ArtifactService
 from maestro.application.planner import (
     PlannerOutputError,
+    PlannerProviderError,
     PlannerRuntime,
     build_planner_input,
 )
@@ -49,10 +50,13 @@ from maestro.domain.projects import (
 )
 from maestro.domain.providers import (
     Provider,
+    ProviderErrorCode,
+    ProviderFailure,
     ProviderFeatureSet,
     ProviderHealth,
     ProviderMessage,
     ProviderModelList,
+    ProviderOperationError,
     ProviderPhase,
     ProviderSpec,
     ProviderTokenUsage,
@@ -115,6 +119,23 @@ class RecordingProvider:
 
     async def run_tool_loop(self, request: ToolLoopRequest) -> ToolLoopResult:
         return ToolLoopResult(model=request.model, output={})
+
+
+class FailingProvider(RecordingProvider):
+    """Provider that fails structured generation like a real adapter can."""
+
+    async def generate_structured(
+        self,
+        request: StructuredGenerationRequest,
+    ) -> StructuredGenerationResult:
+        self.calls.append(request)
+        raise ProviderOperationError(
+            ProviderFailure(
+                code=ProviderErrorCode.PROVIDER_UNAVAILABLE,
+                message="failed to parse grammar",
+                retryable=True,
+            )
+        )
 
 
 class RecordingPublisher:
@@ -210,6 +231,55 @@ def invalid_planner_output() -> dict[str, Any]:
     }
 
 
+def recoverable_planner_output() -> dict[str, Any]:
+    """Build Planner output with common model formatting drift."""
+
+    return {
+        "summary": "Create a small FastAPI app and verify it.",
+        "assumptions": ("The repository can host a minimal Python app.",),
+        "questions": (
+            {
+                "id": "project_structure",
+                "question": "Should the app use src/ layout?",
+                "blocking": False,
+            },
+        ),
+        "risks": (),
+        "workItems": (
+            {
+                "id": "create_fastapi_app",
+                "title": "Create FastAPI app",
+                "roleRef": {"name": "coding", "version": "v1"},
+                "repositoryRef": "backend",
+                "objective": "Create a FastAPI application.",
+                "acceptanceCriteria": ("Application exposes GET /health.",),
+                "dependsOn": (),
+                "requestedCapabilities": ("coding_fastapi", "python3_8+"),
+            },
+            {
+                "id": "add_automated_test",
+                "title": "Add automated test",
+                "roleRef": {"name": "coding", "version": "v1alpha1"},
+                "repositoryRef": "backend",
+                "objective": "Add automated test coverage.",
+                "acceptanceCriteria": ("Tests assert GET /health returns 200.",),
+                "dependsOn": ("create_fastapi_app",),
+                "requestedCapabilities": ("filesystem_write",),
+            },
+            {
+                "id": "verify_no_database_auth",
+                "title": "Verify no database or auth",
+                "roleRef": {"name": "coding_review", "version": "v1alpha1"},
+                "repositoryRef": "backend",
+                "objective": "Check the app stays minimal.",
+                "acceptanceCriteria": ("No database or authentication is added.",),
+                "dependsOn": ("create_fastapi_app", "add_automated_test"),
+                "requestedCapabilities": ("coding_review",),
+            },
+        ),
+    }
+
+
 def test_build_planner_input_includes_goal_project_context_and_policy(
     tmp_path: Path,
 ) -> None:
@@ -298,6 +368,47 @@ def test_planner_creates_plan_artifacts_and_role_invocation_records(
             for artifact in artifacts
         )
         assert publisher.events[0].event_type == "PlanProduced"
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_planner_normalizes_recoverable_model_output(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        provider_runtime = RecordingProvider((recoverable_planner_output(),))
+        harness = await make_harness(tmp_path)
+
+        result = await harness.runtime.invoke_planner(
+            harness.execution.metadata.id,
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=provider_runtime,
+            granted_capabilities=("filesystem.read",),
+        )
+
+        plans = await harness.plans.list_by_execution(harness.execution.metadata.id)
+        plan = plans[0]
+
+        assert result.plan_ref is not None
+        assert result.repair_attempted is False
+        assert result.questions[0].id == "project-structure"
+        assert tuple(item.id for item in plan.spec.work_items) == (
+            "create-fastapi-app",
+            "add-automated-test",
+            "verify-no-database-auth",
+        )
+        assert plan.spec.work_items[1].depends_on == ("create-fastapi-app",)
+        assert plan.spec.work_items[2].depends_on == (
+            "create-fastapi-app",
+            "add-automated-test",
+        )
+        assert plan.spec.work_items[0].requested_capabilities == ()
+        assert plan.spec.work_items[1].requested_capabilities == ("filesystem.write",)
+        assert plan.spec.work_items[2].role_ref.name == "coding"
+        assert all(item.role_ref.version == "v1alpha1" for item in plan.spec.work_items)
+        assert plan.status.phase == PlanPhase.DRAFT
         harness.close()
 
     asyncio.run(scenario())
@@ -400,6 +511,52 @@ def test_planner_raises_after_one_repair_attempt_for_invalid_output(
             )
             == 2
         )
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_planner_marks_provider_failure_and_allows_retry(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        failing_provider = FailingProvider(())
+
+        with pytest.raises(PlannerProviderError):
+            await harness.runtime.invoke_planner(
+                harness.execution.metadata.id,
+                agent=agent_resource(),
+                provider=provider_resource(),
+                runtime=failing_provider,
+                granted_capabilities=("filesystem.read",),
+            )
+
+        first_invocation = (
+            await harness.role_invocations.list_by_execution(
+                harness.execution.metadata.id
+            )
+        )[0]
+        assert first_invocation.status.phase == RoleInvocationPhase.FAILED
+        assert first_invocation.status.failure is not None
+        assert first_invocation.status.failure.reason == "PlannerProviderFailed"
+
+        retry_provider = RecordingProvider((valid_planner_output(),))
+        result = await harness.runtime.invoke_planner(
+            harness.execution.metadata.id,
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=retry_provider,
+            granted_capabilities=("filesystem.read",),
+        )
+
+        invocations = await harness.role_invocations.list_by_execution(
+            harness.execution.metadata.id
+        )
+        assert result.plan_ref is not None
+        assert len(invocations) == 2
+        assert invocations[0].metadata.name != invocations[1].metadata.name
+        assert invocations[1].status.phase == RoleInvocationPhase.SUCCEEDED
         harness.close()
 
     asyncio.run(scenario())

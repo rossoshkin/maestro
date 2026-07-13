@@ -154,7 +154,7 @@ def test_filesystem_tools_persist_artifacts_and_events(tmp_path: Path) -> None:
         )
         written = await harness.runtime.execute_tool(
             "write-file",
-            {"path": "new.txt", "content": "hello\n"},
+            {"path": "new.txt", "content": "hello\n", "executable": True},
             workspace=harness.workspace,
             work_item=harness.work_item,
             granted_capabilities=("filesystem.write",),
@@ -175,8 +175,10 @@ def test_filesystem_tools_persist_artifacts_and_events(tmp_path: Path) -> None:
         assert listed.status == ToolExecutionStatus.SUCCEEDED
         assert read.output["content"] == "print('old')\n"
         assert written.output["bytesWritten"] == 6
+        assert written.output["executable"] is True
         assert edited.output["occurrencesReplaced"] == 1
         assert (tmp_path / "workspace" / "new.txt").read_text() == "hello\n"
+        assert (tmp_path / "workspace" / "new.txt").stat().st_mode & 0o111
         assert (tmp_path / "workspace" / "app.py").read_text() == "print('new')\n"
         assert len(artifacts) == 4
         assert all(
@@ -285,6 +287,31 @@ def test_command_arguments_cannot_target_paths_outside_workspace(
 
         assert result.status == ToolExecutionStatus.DENIED
         assert provider.command_requests == []
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_run_command_rejects_shell_redirection_as_plain_argument(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        harness = make_harness(tmp_path)
+        provider = RecordingWorkspaceProvider()
+
+        result = await harness.runtime.execute_tool(
+            "run-command",
+            {"command": ("echo", "'hello world' > hello_world.sh")},
+            workspace=harness.workspace,
+            work_item=harness.work_item,
+            workspace_provider=provider,
+            granted_capabilities=("shell.execute.test",),
+        )
+
+        assert result.status == ToolExecutionStatus.DENIED
+        assert result.message.startswith("run-command executes argv directly")
+        assert provider.command_requests == []
+        assert not (tmp_path / "workspace" / "hello_world.sh").exists()
         harness.close()
 
     asyncio.run(scenario())

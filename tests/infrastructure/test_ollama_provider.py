@@ -155,6 +155,60 @@ def test_ollama_provider_generates_structured_output() -> None:
     asyncio.run(scenario())
 
 
+def test_ollama_provider_strips_regex_patterns_from_format_schema() -> None:
+    async def scenario() -> None:
+        transport = FakeOllamaTransport()
+        transport.queue_get("/api/tags", tags_response("qwen3:14b"))
+        transport.queue_post(
+            "/api/chat",
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": '{"requestedCapabilities": ["filesystem.read"]}',
+                },
+            },
+        )
+        provider = OllamaProvider(
+            endpoint="http://127.0.0.1:11434",
+            transport=transport,
+        )
+        schema = {
+            "type": "object",
+            "properties": {
+                "requestedCapabilities": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "pattern": r"^[a-z0-9][a-z0-9.\-]*$",
+                    },
+                }
+            },
+        }
+
+        await provider.generate_structured(
+            StructuredGenerationRequest(
+                model="qwen3:14b",
+                messages=(message(),),
+                responseSchema=schema,
+            )
+        )
+
+        _, _, payload, _ = transport.requests[-1]
+        assert payload is not None
+        assert payload["format"] == {
+            "type": "object",
+            "properties": {
+                "requestedCapabilities": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                }
+            },
+        }
+        assert schema["properties"]["requestedCapabilities"]["items"]["pattern"]
+
+    asyncio.run(scenario())
+
+
 def test_ollama_provider_rejects_missing_model_before_generation() -> None:
     async def scenario() -> None:
         transport = FakeOllamaTransport()
@@ -254,6 +308,60 @@ def test_ollama_provider_exchanges_tool_calls() -> None:
             {"name": "pytest", "arguments": {"path": "tests"}},
         )
         assert result.token_usage.output_tokens == 5
+
+    asyncio.run(scenario())
+
+
+def test_ollama_provider_parses_fenced_json_tool_call_content() -> None:
+    async def scenario() -> None:
+        transport = FakeOllamaTransport()
+        transport.queue_get("/api/tags", tags_response("qwen3:14b"))
+        transport.queue_post(
+            "/api/chat",
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": (
+                        "```json\n"
+                        "{\n"
+                        '  "name": "write-file",\n'
+                        '  "arguments": {\n'
+                        '    "path": "README.md",\n'
+                        '    "content": "Run with `./hello.sh`.\\n```sh\\n'
+                        'echo hello\\n```"\n'
+                        "  }\n"
+                        "}\n"
+                        "```"
+                    ),
+                },
+            },
+        )
+        provider = OllamaProvider(
+            endpoint="http://127.0.0.1:11434",
+            transport=transport,
+        )
+
+        result = await provider.run_tool_loop(
+            ToolLoopRequest(
+                model="qwen3:14b",
+                messages=(message("Update docs"),),
+                tools=(
+                    ProviderToolDefinition(
+                        name="write-file",
+                        description="Write a file",
+                        inputSchema={"type": "object"},
+                    ),
+                ),
+            )
+        )
+
+        assert result.output == {
+            "name": "write-file",
+            "arguments": {
+                "path": "README.md",
+                "content": "Run with `./hello.sh`.\n```sh\necho hello\n```",
+            },
+        }
 
     asyncio.run(scenario())
 

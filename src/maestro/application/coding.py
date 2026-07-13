@@ -78,6 +78,9 @@ Use exactly the granted Capabilities and do not request prohibited operations.
 Inspect relevant files before editing. Keep changes focused on the Work Item.
 When no more tools are needed, return only a compact JSON object matching the
 supplied Coding output schema.
+If a script must be executable, write it with executable=true or use run-command
+to chmod it, then run the script when shell.execute.test is granted.
+Do not return blocked for issues you can resolve with the granted tools.
 Do not claim tests passed unless you observed command output through tools.
 Do not mark the Work Item verified; Maestro verifies independently.
 """
@@ -420,6 +423,22 @@ class CodingRuntime:
                     tool_artifact_refs=tuple(tool_artifact_refs),
                     reason="CodingOutputInvalid",
                     message=str(error),
+                    status=LiteralRuntimeStatus.INVALID_OUTPUT,
+                )
+            if (
+                coding_output.status == CodingOutputStatus.COMPLETED
+                and coding_output.questions
+            ):
+                return await self._finish_failed(
+                    running_work_item,
+                    running_invocation,
+                    provider=provider,
+                    model=agent.spec.model,
+                    prompt_artifact=prompt_artifact,
+                    response_artifact=response_artifact,
+                    tool_artifact_refs=tuple(tool_artifact_refs),
+                    reason="CodingOutputInvalid",
+                    message="completed CodingOutput must not include questions",
                     status=LiteralRuntimeStatus.INVALID_OUTPUT,
                 )
 
@@ -1134,12 +1153,30 @@ def _coding_prompt(
 
 
 def _tool_calls_from_output(output: dict[str, Any]) -> tuple[CodingToolCall, ...]:
-    raw_calls = output.get("toolCalls", ())
+    raw_calls: Any
+    if _looks_like_single_tool_call(output):
+        raw_calls = (output,)
+    else:
+        content = output.get("content")
+        if isinstance(content, dict) and _looks_like_single_tool_call(content):
+            raw_calls = (content,)
+        elif isinstance(content, dict) and set(output) == {"content"}:
+            raw_calls = content.get("toolCalls", ())
+        else:
+            raw_calls = output.get("toolCalls", ())
     if raw_calls in (None, ()):
         return ()
     if not isinstance(raw_calls, (list, tuple)):
         raise ValueError("toolCalls must be a list")
     return tuple(CodingToolCall.model_validate(call) for call in raw_calls)
+
+
+def _looks_like_single_tool_call(output: dict[str, Any]) -> bool:
+    return (
+        isinstance(output.get("name"), str)
+        and isinstance(output.get("arguments"), dict)
+        and set(output).issubset({"name", "arguments"})
+    )
 
 
 def _coding_output_candidate(output: dict[str, Any]) -> dict[str, Any]:

@@ -68,6 +68,18 @@ DENIED_EXECUTABLES = frozenset(
     }
 )
 SHELL_EXECUTABLES = frozenset({"bash", "fish", "sh", "zsh"})
+SHELL_SYNTAX_TOKENS = frozenset(
+    {
+        ">",
+        ">>",
+        "<",
+        "<<",
+        "|",
+        "||",
+        "&&",
+        ";",
+    }
+)
 
 
 class ToolExecutionStatus(StrEnum):
@@ -122,6 +134,7 @@ class WriteFileInput(MaestroModel):
 
     path: str = Field(min_length=1)
     content: str
+    executable: bool = False
 
 
 class EditFileInput(MaestroModel):
@@ -730,9 +743,12 @@ def _write_file(root: Path, tool_input: WriteFileInput) -> dict[str, Any]:
         )
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(tool_input.content)
+    if tool_input.executable:
+        target.chmod(target.stat().st_mode | 0o111)
     return {
         "path": _relative_path(root, target),
         "bytesWritten": len(tool_input.content.encode("utf-8")),
+        "executable": tool_input.executable,
     }
 
 
@@ -916,6 +932,15 @@ def _validate_command_policy(command: tuple[str, ...]) -> None:
             "CommandDenied",
             "shell -c commands are denied by command policy",
         )
+    if any(_contains_shell_syntax(argument) for argument in args):
+        raise ToolPolicyDeniedError(
+            "ShellSyntaxDenied",
+            (
+                "run-command executes argv directly, not through a shell; "
+                "use write-file/edit-file for file changes instead of shell "
+                "redirection or operators"
+            ),
+        )
     if executable == "rm" and _has_flag(args, "r") and _has_flag(args, "f"):
         raise ToolPolicyDeniedError(
             "CommandDenied",
@@ -936,6 +961,11 @@ def _validate_command_policy(command: tuple[str, ...]) -> None:
             "CommandDenied",
             "docker system prune is denied by command policy",
         )
+
+
+def _contains_shell_syntax(argument: str) -> bool:
+    parts = argument.split()
+    return any(token in SHELL_SYNTAX_TOKENS for token in parts)
 
 
 def _validate_command_path_arguments(

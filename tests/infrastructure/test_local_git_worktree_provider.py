@@ -123,6 +123,31 @@ def test_prepare_creates_isolated_worktree_without_dirtying_source(tmp_path) -> 
     asyncio.run(scenario())
 
 
+def test_prepare_recovers_missing_registered_worktree(tmp_path) -> None:
+    async def scenario() -> None:
+        source = create_source_repository(tmp_path)
+        workspace_root = tmp_path / "workspaces"
+        workspace = valid_workspace()
+        provider = LocalGitWorktreeProvider(git_binary())
+        request = prepare_request(
+            workspace,
+            source=source,
+            workspace_root=workspace_root,
+        )
+        stale_handle = await provider.prepare(request)
+        shutil.rmtree(stale_handle.path)
+
+        recovered_handle = await provider.prepare(request)
+
+        assert recovered_handle.path == stale_handle.path
+        assert recovered_handle.path.exists()
+        assert run_git(recovered_handle.path, "branch", "--show-current") == (
+            workspace.spec.branch_name
+        )
+
+    asyncio.run(scenario())
+
+
 def test_prepare_rejects_worktree_inside_source_checkout(tmp_path) -> None:
     async def scenario() -> None:
         source = create_source_repository(tmp_path)
@@ -211,6 +236,8 @@ def test_provider_collects_status_diff_and_runs_commands(tmp_path) -> None:
             )
         )
         (handle.path / "README.md").write_text("changed\n")
+        (handle.path / "hello-world.sh").write_text("#!/bin/sh\necho hello\n")
+        (handle.path / "hello-world.sh").chmod(0o755)
 
         state = await provider.collect_state(handle)
         diff = await provider.collect_diff(handle)
@@ -222,6 +249,9 @@ def test_provider_collects_status_diff_and_runs_commands(tmp_path) -> None:
         assert state.dirty is True
         assert "-source" in diff.text
         assert "+changed" in diff.text
+        assert "new file mode 100755" in diff.text
+        assert "hello-world.sh" in diff.text
+        assert "+echo hello" in diff.text
         assert result.exit_code == 0
         assert "README.md" in result.stdout
 

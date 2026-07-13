@@ -6,9 +6,10 @@ import asyncio
 import json
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol, cast
 
 from maestro.domain.modeling import ModelIdentifier
 from maestro.domain.providers import (
@@ -30,6 +31,22 @@ from maestro.domain.providers import (
 )
 
 DEFAULT_CODEX_MODEL = "codex-default"
+CODEX_UNSUPPORTED_SCHEMA_KEYS = {
+    "default",
+    "exclusiveMaximum",
+    "exclusiveMinimum",
+    "format",
+    "maxItems",
+    "maxLength",
+    "maximum",
+    "minItems",
+    "minLength",
+    "minimum",
+    "multipleOf",
+    "pattern",
+    "title",
+    "uniqueItems",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,7 +217,9 @@ class CodexProvider(ModelProvider):
             temp_dir = Path(temp_dir_name)
             schema_path = temp_dir / "schema.json"
             output_path = temp_dir / "output.json"
-            schema_path.write_text(json.dumps(request.response_schema or {}))
+            schema_path.write_text(
+                json.dumps(_schema_for_codex(request.response_schema or {}))
+            )
             command = _exec_command(
                 self._executable,
                 model=request.model,
@@ -259,13 +278,11 @@ def _exec_command(
     schema_path: Path,
     output_path: Path,
 ) -> tuple[str, ...]:
-    return (
+    command: tuple[str, ...] = (
         executable,
         "exec",
         "--sandbox",
         "read-only",
-        "--ask-for-approval",
-        "never",
         "--skip-git-repo-check",
         "--ephemeral",
         "--ignore-rules",
@@ -275,10 +292,31 @@ def _exec_command(
         str(schema_path),
         "--output-last-message",
         str(output_path),
-        "-m",
-        model,
-        "-",
     )
+    if model != DEFAULT_CODEX_MODEL:
+        command = (*command, "-m", model)
+    return (*command, "-")
+
+
+def _schema_for_codex(schema: Mapping[str, Any]) -> dict[str, Any]:
+    return cast(dict[str, Any], _sanitize_schema_for_codex(schema))
+
+
+def _sanitize_schema_for_codex(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        sanitized = {
+            str(key): _sanitize_schema_for_codex(item)
+            for key, item in value.items()
+            if key not in CODEX_UNSUPPORTED_SCHEMA_KEYS
+        }
+        properties = sanitized.get("properties")
+        if isinstance(properties, dict):
+            sanitized["required"] = list(properties)
+            sanitized.setdefault("additionalProperties", False)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_schema_for_codex(item) for item in value]
+    return value
 
 
 def _prompt_from_messages(messages: tuple[ProviderMessage, ...]) -> str:

@@ -1,9 +1,17 @@
 """Application service for Project resource use cases."""
 
+import subprocess
 from pathlib import Path
 from uuid import UUID
 
-from maestro.domain.projects import Project, ProjectRepository, ProjectSpec
+from maestro.domain.projects import (
+    Project,
+    ProjectRepository,
+    ProjectRepositoryStatus,
+    ProjectSpec,
+)
+
+GIT_TIMEOUT_SECONDS = 10
 
 
 class ProjectService:
@@ -94,3 +102,54 @@ class ProjectService:
                     raise ValueError(
                         "repository path must not be nested inside Maestro data roots"
                     )
+
+
+def observe_local_project_repositories(
+    project: Project,
+) -> tuple[ProjectRepositoryStatus, ...]:
+    """Observe local Git repository bindings for Project readiness."""
+
+    return tuple(
+        _observe_repository(repository.id, repository.path)
+        for repository in project.spec.repositories
+    )
+
+
+def _observe_repository(repository_id: str, path: Path) -> ProjectRepositoryStatus:
+    if not path.exists() or not path.is_dir():
+        return ProjectRepositoryStatus(
+            id=repository_id,
+            reachable=False,
+            gitRepository=False,
+            clean=False,
+        )
+
+    inside = _git(path, "rev-parse", "--is-inside-work-tree")
+    git_repository = inside.returncode == 0 and inside.stdout.strip() == "true"
+    if not git_repository:
+        return ProjectRepositoryStatus(
+            id=repository_id,
+            reachable=True,
+            gitRepository=False,
+            clean=False,
+        )
+
+    status = _git(path, "status", "--porcelain")
+    head = _git(path, "rev-parse", "HEAD")
+    return ProjectRepositoryStatus(
+        id=repository_id,
+        reachable=True,
+        gitRepository=True,
+        clean=status.returncode == 0 and status.stdout.strip() == "",
+        headRevision=head.stdout.strip() if head.returncode == 0 else None,
+    )
+
+
+def _git(path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ("git", "-C", str(path), *args),
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )

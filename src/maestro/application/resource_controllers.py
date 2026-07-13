@@ -62,6 +62,7 @@ from maestro.domain.projects import (
     Project,
     ProjectPhase,
     ProjectRepository,
+    ProjectRepositoryStatus,
     ProjectStatus,
 )
 from maestro.domain.providers import (
@@ -86,6 +87,7 @@ from maestro.domain.reviews import (
     ReviewArtifactReference,
     ReviewExecutionReference,
     ReviewPhase,
+    ReviewPolicy,
     ReviewRepository,
     ReviewRoleReference,
     ReviewSpec,
@@ -138,9 +140,15 @@ class ProjectController:
         self,
         repository: ProjectRepository,
         *,
+        repository_observer: Callable[
+            [Project],
+            tuple[ProjectRepositoryStatus, ...],
+        ]
+        | None = None,
         event_publisher: EventPublisher | None = None,
     ) -> None:
         self._repository = repository
+        self._repository_observer = repository_observer
         self._writer = StatusWriter(
             repository,
             event_publisher=event_publisher,
@@ -149,12 +157,22 @@ class ProjectController:
 
     async def reconcile(self, context: ReconciliationContext) -> ReconcileResult:
         project = await self._repository.get(context.resource_id)
+        repositories = (
+            self._repository_observer(project)
+            if self._repository_observer is not None
+            else project.status.repositories
+        )
 
         def build(current: Project) -> ProjectStatus:
-            phase = _project_phase(current)
+            phase = _project_phase(current, repository_statuses=repositories)
             status = observe_generation(
                 current,
-                current.status.model_copy(update={"phase": phase}),
+                current.status.model_copy(
+                    update={
+                        "phase": phase,
+                        "repositories": repositories,
+                    }
+                ),
             )
             return with_condition(
                 current,
@@ -1166,6 +1184,9 @@ class ExecutionController:
                 ),
                 subjectRefs=subject_refs,
                 acceptanceCriteria=_review_acceptance_criteria(execution, work_item),
+                policy=ReviewPolicy(
+                    requireTests=await self._review_requires_tests(execution),
+                ),
             ),
         )
         return await self._review_repository.create(review)
@@ -1178,9 +1199,14 @@ class ExecutionController:
         if self._artifact_repository is None:
             return ()
 
-        artifacts = await self._artifact_repository.list_by_work_item(
-            work_item.metadata.id
-        )
+        work_items = await self._review_subject_work_items(execution, work_item)
+        artifacts: list[Artifact] = []
+        for subject_work_item in work_items:
+            artifacts.extend(
+                await self._artifact_repository.list_by_work_item(
+                    subject_work_item.metadata.id
+                )
+            )
         review_artifacts = tuple(
             artifact
             for artifact in artifacts
@@ -1189,6 +1215,7 @@ class ExecutionController:
             in {
                 ArtifactType.GIT_DIFF,
                 ArtifactType.SUMMARY,
+                ArtifactType.TOOL_LOG,
                 ArtifactType.VERIFICATION_REPORT,
             }
         )
@@ -1209,6 +1236,35 @@ class ExecutionController:
                 review_artifacts,
                 key=lambda item: (item.spec.artifact_type, item.metadata.name),
             )
+        )
+
+    async def _review_subject_work_items(
+        self,
+        execution: Execution,
+        work_item: WorkItem,
+    ) -> tuple[WorkItem, ...]:
+        if self._work_item_repository is None:
+            return (work_item,)
+
+        work_items = await self._work_item_repository.list_by_execution(
+            execution.metadata.id
+        )
+        succeeded = tuple(
+            item for item in work_items if item.status.phase == WorkItemPhase.SUCCEEDED
+        )
+        return succeeded or (work_item,)
+
+    async def _review_requires_tests(self, execution: Execution) -> bool:
+        if self._work_item_repository is None:
+            return True
+
+        work_items = await self._work_item_repository.list_by_execution(
+            execution.metadata.id
+        )
+        return any(
+            work_item.status.phase == WorkItemPhase.SUCCEEDED
+            and bool(work_item.spec.verification.commands)
+            for work_item in work_items
         )
 
     async def _route_review_request_changes(
@@ -1516,18 +1572,26 @@ class ExecutionController:
         await _write_if_changed(execution, self._writer, build)
 
 
-def _project_phase(project: Project) -> ProjectPhase:
+def _project_phase(
+    project: Project,
+    *,
+    repository_statuses: tuple[ProjectRepositoryStatus, ...] | None = None,
+) -> ProjectPhase:
     if project.spec.archived:
         return ProjectPhase.ARCHIVED
     if not project.spec.repositories:
         return ProjectPhase.READY
-    if len(project.status.repositories) < len(project.spec.repositories):
+    statuses = repository_statuses or project.status.repositories
+    if len(statuses) < len(project.spec.repositories):
         return ProjectPhase.VALIDATING
-    if all(
-        status.reachable and status.git_repository
-        for status in project.status.repositories
-    ):
+    runnable = all(
+        status.reachable and status.git_repository and status.head_revision is not None
+        for status in statuses
+    )
+    if runnable and all(status.clean for status in statuses):
         return ProjectPhase.READY
+    if runnable:
+        return ProjectPhase.DEGRADED
     return ProjectPhase.ERROR
 
 

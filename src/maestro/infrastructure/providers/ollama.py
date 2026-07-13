@@ -9,7 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from maestro.domain.providers import (
     ModelProvider,
@@ -231,7 +231,7 @@ class OllamaProvider(ModelProvider):
             "model": request.model,
             "messages": _messages_payload(request.messages),
             "stream": False,
-            "format": request.response_schema or "json",
+            "format": _schema_format_for_ollama(request.response_schema),
         }
         response = await self._post_json(
             "/api/chat",
@@ -378,6 +378,31 @@ def _tool_payload(tool: ProviderToolDefinition) -> JsonObject:
     }
 
 
+def _schema_format_for_ollama(schema: Mapping[str, Any]) -> JsonObject | str:
+    if not schema:
+        return "json"
+    return cast(JsonObject, _sanitize_schema_for_ollama(schema))
+
+
+def _sanitize_schema_for_ollama(value: Any) -> Any:
+    """Remove JSON Schema keywords that llama.cpp grammar rejects.
+
+    Pydantic still validates the parsed model output after generation. This
+    sanitizer only relaxes Ollama's generation grammar enough to avoid known
+    parser failures such as escaped hyphens in regex character classes.
+    """
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _sanitize_schema_for_ollama(item)
+            for key, item in value.items()
+            if key != "pattern"
+        }
+    if isinstance(value, list):
+        return [_sanitize_schema_for_ollama(item) for item in value]
+    return value
+
+
 def _message_content(response: JsonObject, *, allow_empty: bool = False) -> str:
     message = response.get("message")
     content: Any
@@ -400,6 +425,7 @@ def _parse_json_object_content(
     error_code: ProviderErrorCode,
     error_message: str,
 ) -> JsonObject:
+    content = _strip_json_code_fence(content)
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError as error:
@@ -412,12 +438,32 @@ def _parse_json_object_content(
 def _parse_optional_json_content(content: str) -> JsonObject | str:
     if not content:
         return {}
+    content = _strip_json_code_fence(content)
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:
         return content
     if isinstance(parsed, dict):
         return parsed
+    return content
+
+
+def _strip_json_code_fence(content: str) -> str:
+    stripped = content.strip()
+    if not stripped.startswith("```"):
+        return content
+
+    header_end = stripped.find("\n")
+    if header_end == -1:
+        return content
+
+    language = stripped[3:header_end].strip().lower()
+    if language not in {"", "json"}:
+        return content
+
+    body = stripped[header_end + 1 :]
+    if body.endswith("```"):
+        return body[:-3].rstrip()
     return content
 
 

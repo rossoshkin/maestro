@@ -102,9 +102,14 @@ Open:
 http://127.0.0.1:7860/ui
 ```
 
-The UI shows Projects, Executions, Plans, Work Items, Role Invocations,
-Artifacts, Reviews, Approvals, and the Event timeline. It reads and acts through
-the REST API; orchestration remains in application controllers and runtimes.
+Use the Project form in the left sidebar to create a Project, then use the New
+Execution form in the main panel to create an Execution. Select the Execution
+and click `Run`; a draft Execution starts planning, and an already-started
+Execution resumes the local backend runner. The runner invokes Ollama/Codex,
+prepares Workspaces, runs Coding, verifies changes, and stops only when human
+approval is required or the Execution reaches a terminal phase. The UI shows
+Plans, Work Items, Role Invocations, Artifacts, Reviews, Approvals, and the Event
+timeline as the backend works.
 
 ### 8. Run the MVP Demo Harness
 

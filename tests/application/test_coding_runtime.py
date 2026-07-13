@@ -325,6 +325,60 @@ def test_coding_runtime_creates_file_and_persists_evidence(tmp_path: Path) -> No
     asyncio.run(scenario())
 
 
+def test_coding_runtime_accepts_single_tool_call_object(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        model = RecordingModelProvider(
+            (
+                {
+                    "name": "write-file",
+                    "arguments": {
+                        "path": "hello.sh",
+                        "content": "#!/bin/sh\necho hello\n",
+                        "executable": True,
+                    },
+                },
+                completed_output(
+                    summary="Created executable hello script.",
+                    changed_path="hello.sh",
+                ),
+            )
+        )
+        workspace_provider = RecordingWorkspaceProvider(
+            status_stdout="?? hello.sh\n",
+            diff="diff --git a/hello.sh b/hello.sh\n+echo hello\n",
+        )
+
+        result = await harness.runtime.invoke_coding(
+            harness.work_item.metadata.id,
+            workspace=harness.workspace,
+            workspace_provider=workspace_provider,
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=model,
+            granted_capabilities=granted_capabilities(),
+            max_steps=3,
+            max_duration_seconds=60,
+        )
+
+        invocation = (
+            await harness.role_invocations.list_by_work_item(
+                harness.work_item.metadata.id
+            )
+        )[0]
+
+        assert result.status == CodingOutputStatus.COMPLETED
+        script = tmp_path / "workspace" / "hello.sh"
+        assert script.read_text() == "#!/bin/sh\necho hello\n"
+        assert script.stat().st_mode & 0o111
+        assert invocation.status.phase == RoleInvocationPhase.SUCCEEDED
+        assert invocation.status.tool_call_count == 1
+        assert len(result.tool_artifact_refs) == 1
+        harness.close()
+
+    asyncio.run(scenario())
+
+
 def test_endpoint_fixture_edits_existing_file(tmp_path: Path) -> None:
     async def scenario() -> None:
         harness = await make_harness(tmp_path)
@@ -456,6 +510,45 @@ def test_coding_runtime_rejects_invalid_final_output(tmp_path: Path) -> None:
             ArtifactType.PROMPT,
             ArtifactType.MODEL_RESPONSE,
         }
+        harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_coding_runtime_rejects_completed_output_with_questions(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        harness = await make_harness(tmp_path)
+        output = completed_output()
+        output["questions"] = ("Should this be implemented?",)
+        model = RecordingModelProvider((output,))
+
+        result = await harness.runtime.invoke_coding(
+            harness.work_item.metadata.id,
+            workspace=harness.workspace,
+            workspace_provider=RecordingWorkspaceProvider(),
+            agent=agent_resource(),
+            provider=provider_resource(),
+            runtime=model,
+            granted_capabilities=granted_capabilities(),
+        )
+
+        updated_item = await harness.work_items.get(harness.work_item.metadata.id)
+        invocation = (
+            await harness.role_invocations.list_by_work_item(
+                harness.work_item.metadata.id
+            )
+        )[0]
+
+        assert result.status == LiteralRuntimeStatus.INVALID_OUTPUT
+        assert updated_item.status.phase == WorkItemPhase.FAILED
+        assert invocation.status.phase == RoleInvocationPhase.FAILED
+        assert invocation.status.failure is not None
+        assert invocation.status.failure.reason == "CodingOutputInvalid"
+        assert invocation.status.failure.message == (
+            "completed CodingOutput must not include questions"
+        )
         harness.close()
 
     asyncio.run(scenario())

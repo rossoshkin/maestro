@@ -79,6 +79,9 @@ HTML_SHELL = """<!doctype html>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand">
+        <button id="clear-data" type="button" class="clear-data-button">
+          Clear Data
+        </button>
         <span class="brand-mark" aria-hidden="true">M</span>
         <div>
           <h1>Maestro</h1>
@@ -102,6 +105,27 @@ HTML_SHELL = """<!doctype html>
           <h2>Projects</h2>
           <span id="project-count" class="muted">0</span>
         </div>
+        <form id="project-form" class="project-form">
+          <label>
+            <span>Name</span>
+            <input id="project-name" name="name" autocomplete="off" required>
+          </label>
+          <label>
+            <span>Description</span>
+            <input id="project-description" name="description" autocomplete="off">
+          </label>
+          <label>
+            <span>Repository Path</span>
+            <input id="project-repository-path" name="repositoryPath"
+              autocomplete="off">
+          </label>
+          <label>
+            <span>Default Branch</span>
+            <input id="project-default-branch" name="defaultBranch"
+              autocomplete="off" value="main">
+          </label>
+          <button type="submit" class="primary-button">Create Project</button>
+        </form>
         <div id="project-list" class="resource-list" aria-live="polite"></div>
       </aside>
 
@@ -154,6 +178,9 @@ HTML_SHELL = """<!doctype html>
               <h2 id="execution-title">No execution selected</h2>
             </div>
             <div class="button-row">
+              <button id="run-execution" type="button" class="primary-button">
+                Start
+              </button>
               <button id="cancel-execution" type="button" class="danger-button">
                 Cancel
               </button>
@@ -161,6 +188,22 @@ HTML_SHELL = """<!doctype html>
           </div>
           <div id="execution-list" class="resource-list compact"></div>
           <div id="execution-overview" class="overview-grid"></div>
+        </section>
+
+        <section id="user-input-panel" class="surface"
+          aria-labelledby="user-input-title" hidden>
+          <div class="section-header">
+            <div>
+              <p class="eyebrow">Input</p>
+              <h2 id="user-input-title">Planner Questions</h2>
+            </div>
+          </div>
+          <form id="user-input-form" class="question-form">
+            <div id="user-input-list" class="resource-list"></div>
+            <div class="form-actions">
+              <button type="submit" class="primary-button">Submit Answers</button>
+            </div>
+          </form>
         </section>
 
         <section class="surface" aria-labelledby="plan-title">
@@ -373,6 +416,19 @@ textarea:disabled {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.clear-data-button {
+  border-color: #f3b0b0;
+  background: #fff5f5;
+  color: #9f1d1d;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 0 10px;
+}
+
+.clear-data-button:hover {
+  border-color: #d73535;
 }
 
 .brand-mark {
@@ -609,13 +665,23 @@ textarea:disabled {
   overflow-wrap: anywhere;
 }
 
+.project-form {
+  display: grid;
+  gap: 10px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+}
+
 .execution-form {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
 
-.execution-form label {
+.project-form label,
+.execution-form label,
+.question-form label {
   display: grid;
   gap: 6px;
   color: var(--muted);
@@ -623,8 +689,10 @@ textarea:disabled {
   font-weight: 700;
 }
 
+.project-form input,
 .execution-form input,
-.execution-form textarea {
+.execution-form textarea,
+.question-form textarea {
   width: 100%;
   border: 1px solid var(--line-strong);
   border-radius: 6px;
@@ -641,6 +709,16 @@ textarea:disabled {
 .form-actions {
   display: flex;
   justify-content: flex-end;
+}
+
+.question-form {
+  display: grid;
+  gap: 12px;
+}
+
+.question-row {
+  display: grid;
+  gap: 8px;
 }
 
 .timeline {
@@ -666,6 +744,13 @@ textarea:disabled {
 .sequence {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+}
+
+.event-payload {
+  color: var(--text);
+  display: block;
+  font-size: 12px;
+  margin-top: 3px;
 }
 
 .artifact-preview pre {
@@ -726,6 +811,8 @@ const state = {
   selectedExecutionId: null,
   selectedArtifactId: null,
   eventSource: null,
+  userInputDraft: {},
+  loading: false,
 };
 
 const elements = {};
@@ -733,15 +820,22 @@ const elements = {};
 window.addEventListener("DOMContentLoaded", () => {
   bindElements();
   bindActions();
+  startAutoRefresh();
   void loadAll();
 });
 
 function bindElements() {
   for (const id of [
     "connection-state",
+    "clear-data",
     "refresh-button",
     "ui-error",
     "project-count",
+    "project-form",
+    "project-name",
+    "project-description",
+    "project-repository-path",
+    "project-default-branch",
     "project-list",
     "project-title",
     "project-phase",
@@ -754,7 +848,11 @@ function bindElements() {
     "execution-list",
     "execution-title",
     "execution-overview",
+    "run-execution",
     "cancel-execution",
+    "user-input-panel",
+    "user-input-form",
+    "user-input-list",
     "plan-view",
     "event-timeline",
     "work-item-list",
@@ -769,17 +867,41 @@ function bindElements() {
 }
 
 function bindActions() {
-  elements["refresh-button"].addEventListener("click", () => void loadAll());
+  elements["clear-data"].addEventListener("click", () => {
+    void clearData();
+  });
+  elements["refresh-button"].addEventListener("click", () => {
+    void loadAll({force: true});
+  });
+  elements["project-form"].addEventListener("submit", event => {
+    event.preventDefault();
+    void createProject();
+  });
   elements["execution-form"].addEventListener("submit", event => {
     event.preventDefault();
     void createExecution();
   });
+  elements["run-execution"].addEventListener("click", () => {
+    void runExecution();
+  });
   elements["cancel-execution"].addEventListener("click", () => {
     void cancelExecution();
   });
+  elements["user-input-form"].addEventListener("submit", event => {
+    event.preventDefault();
+    void submitUserInput();
+  });
 }
 
-async function loadAll() {
+async function loadAll(options = {}) {
+  if (!options.force && hasActiveFormControl()) {
+    return;
+  }
+  if (state.loading) {
+    return;
+  }
+  captureUserInputDraft();
+  state.loading = true;
   setConnection("Loading");
   clearError();
   try {
@@ -796,6 +918,8 @@ async function loadAll() {
   } catch (error) {
     showError(error);
     setConnection("Offline");
+  } finally {
+    state.loading = false;
   }
 }
 
@@ -866,11 +990,13 @@ async function request(path, options = {}) {
 }
 
 function render() {
+  renderProjectForm();
   renderProjects();
   renderProjectDetail();
   renderExecutionForm();
   renderExecutions();
   renderExecutionOverview();
+  renderUserInput();
   renderPlan();
   renderEvents();
   renderWorkItems();
@@ -878,6 +1004,12 @@ function render() {
   renderArtifacts();
   renderReviews();
   renderApprovals();
+}
+
+function renderProjectForm() {
+  if (!elements["project-default-branch"].value) {
+    elements["project-default-branch"].value = "main";
+  }
 }
 
 function renderProjects() {
@@ -926,6 +1058,15 @@ function renderProjectDetail() {
   elements["project-title"].textContent = project.metadata.name;
   elements["project-phase"].textContent = project.status.phase;
   elements["project-phase"].dataset.phase = project.status.phase;
+  const repositoryDetails = (project.status.repositories || []).map(repository => [
+    `Repo ${repository.id}`,
+    [
+      repository.reachable ? "reachable" : "missing",
+      repository.gitRepository ? "git" : "not git",
+      repository.headRevision ? repository.headRevision.slice(0, 12) : "no HEAD",
+      repository.clean ? "clean" : "dirty",
+    ].join(", "),
+  ]);
   elements["project-metadata"].innerHTML = metaGrid([
     ["Namespace", project.metadata.namespace],
     [
@@ -933,13 +1074,14 @@ function renderProjectDetail() {
       `${project.spec.workflowRef.name}/${project.spec.workflowRef.version}`,
     ],
     ["Repositories", String(project.spec.repositories.length)],
+    ...repositoryDetails,
     ["Resource Version", String(project.metadata.resourceVersion)],
   ]);
 }
 
 function renderExecutionForm() {
   const project = selectedProject();
-  const disabled = !project;
+  const disabled = !project || !["Ready", "Degraded"].includes(project.status.phase);
   for (const control of elements["execution-form"].elements) {
     control.disabled = disabled;
   }
@@ -983,7 +1125,10 @@ function renderExecutions() {
 
 function renderExecutionOverview() {
   const execution = selectedExecution();
-  elements["cancel-execution"].disabled = !execution;
+  elements["run-execution"].disabled = !execution || isTerminalExecution(execution);
+  elements["run-execution"].textContent =
+    execution && execution.status.phase === "Draft" ? "Start" : "Run";
+  elements["cancel-execution"].disabled = !execution || !canCancelExecution(execution);
   if (!execution) {
     elements["execution-overview"].innerHTML = empty("No execution selected.");
     return;
@@ -998,6 +1143,39 @@ function renderExecutionOverview() {
         `review ${execution.status.iteration.review}`
     ),
   ].join("");
+}
+
+function renderUserInput() {
+  captureUserInputDraft();
+  const execution = selectedExecution();
+  const questions = plannerQuestions();
+  const waiting =
+    execution &&
+    execution.status.phase === "WaitingForUserInput" &&
+    questions.length > 0;
+  elements["user-input-panel"].hidden = !waiting;
+  if (!waiting) {
+    elements["user-input-list"].innerHTML = "";
+    if (!execution || execution.status.phase !== "WaitingForUserInput") {
+      state.userInputDraft = {};
+    }
+    return;
+  }
+  elements["user-input-list"].innerHTML = questions
+    .map(question => {
+      const value = state.userInputDraft[question.id] || "";
+      return `
+      <div class="resource-row question-row">
+        <label>
+          <span>${escapeHtml(question.question || question.id)}</span>
+          <textarea rows="3" required
+            data-question-id="${escapeHtml(question.id)}"
+          >${escapeHtml(value)}</textarea>
+        </label>
+      </div>
+    `;
+    })
+    .join("");
 }
 
 function renderPlan() {
@@ -1034,16 +1212,22 @@ function renderEvents() {
   elements["event-timeline"].innerHTML = state.events
     .slice()
     .reverse()
-    .map(event => `
-      <li>
-        <span class="sequence">#${event.spec.sequence}</span>
-        <span>
-          <strong>${escapeHtml(event.spec.type)}</strong><br>
-          <span class="row-meta">${escapeHtml(event.spec.producer)}
-          - ${escapeHtml(event.spec.occurredAt)}</span>
-        </span>
-      </li>
-    `)
+    .map(event => {
+      const summary = eventSummary(event);
+      return `
+        <li>
+          <span class="sequence">#${event.spec.sequence}</span>
+          <span>
+            <strong>${escapeHtml(event.spec.type)}</strong><br>
+            <span class="row-meta">${escapeHtml(event.spec.producer)}
+            - ${escapeHtml(event.spec.occurredAt)}</span>
+            ${summary
+              ? `<span class="event-payload">${escapeHtml(summary)}</span>`
+              : ""}
+          </span>
+        </li>
+      `;
+    })
     .join("");
 }
 
@@ -1179,6 +1363,82 @@ function renderApprovals() {
   bindListAction("approval-list", "reject", id => void decideApproval(id, "reject"));
 }
 
+async function createProject() {
+  const repositoryPath = elements["project-repository-path"].value.trim();
+  const defaultBranch = elements["project-default-branch"].value.trim() || "main";
+  const repositories = repositoryPath
+    ? [
+        {
+          id: "backend",
+          path: repositoryPath,
+          defaultBranch,
+          type: "git",
+        },
+      ]
+    : [];
+  const payload = {
+    name: slug(elements["project-name"].value),
+    spec: {
+      description: elements["project-description"].value,
+      repositories,
+      workflowRef: {
+        name: "software-delivery",
+        version: "v1alpha1",
+      },
+      roleBindings: {
+        planner: {agentRef: {name: "planner-local"}},
+        coding: {agentRef: {name: "coder-local"}},
+        reviewer: {agentRef: {name: "reviewer-local"}},
+      },
+    },
+  };
+  try {
+    const project = await request("/projects", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    state.selectedProjectId = project.metadata.id;
+    state.selectedExecutionId = null;
+    elements["project-form"].reset();
+    elements["project-default-branch"].value = "main";
+    await loadAll({force: true});
+  } catch (error) {
+    showError(error);
+  }
+}
+
+async function clearData() {
+  const confirmed = window.confirm(
+    "Clear all Maestro local data for this test environment?"
+  );
+  if (!confirmed) {
+    return;
+  }
+  try {
+    await request("/admin/clear-data", {
+      method: "POST",
+      body: JSON.stringify({confirm: "CLEAR"}),
+    });
+    state.projects = [];
+    state.executions = [];
+    state.plans = [];
+    state.workItems = [];
+    state.artifacts = [];
+    state.reviews = [];
+    state.approvals = [];
+    state.invocations = [];
+    state.events = [];
+    state.selectedProjectId = null;
+    state.selectedExecutionId = null;
+    state.selectedArtifactId = null;
+    state.userInputDraft = {};
+    elements["artifact-content"].textContent = "No artifact selected.";
+    await loadAll({force: true});
+  } catch (error) {
+    showError(error);
+  }
+}
+
 async function createExecution() {
   const project = selectedProject();
   if (!project) {
@@ -1208,7 +1468,64 @@ async function createExecution() {
     });
     state.selectedExecutionId = execution.metadata.id;
     elements["execution-form"].reset();
-    await loadAll();
+    await loadAll({force: true});
+  } catch (error) {
+    showError(error);
+  }
+}
+
+async function runExecution() {
+  const execution = selectedExecution();
+  if (!execution) {
+    return;
+  }
+  try {
+    const started = await request(
+      `/executions/${execution.metadata.id}/actions/run`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          resourceVersion: execution.metadata.resourceVersion,
+        }),
+      }
+    );
+    state.selectedExecutionId = started.metadata.id;
+    await loadAll({force: true});
+  } catch (error) {
+    showError(error);
+  }
+}
+
+async function submitUserInput() {
+  const execution = selectedExecution();
+  if (!execution) {
+    return;
+  }
+  const answers = Array.from(
+    elements["user-input-list"].querySelectorAll("textarea[data-question-id]")
+  ).map(control => ({
+    questionId: control.dataset.questionId,
+    answer: control.value.trim(),
+  }));
+  if (answers.some(item => !item.answer)) {
+    return;
+  }
+  try {
+    const updated = await request(
+      `/executions/${execution.metadata.id}/actions/respond`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          resourceVersion: execution.metadata.resourceVersion,
+          answers,
+          actor: "local-user",
+          requestSource: "web-ui",
+        }),
+      }
+    );
+    state.selectedExecutionId = updated.metadata.id;
+    state.userInputDraft = {};
+    await loadAll({force: true});
   } catch (error) {
     showError(error);
   }
@@ -1219,14 +1536,22 @@ async function cancelExecution() {
   if (!execution) {
     return;
   }
+  const confirmed = window.confirm(
+    `Cancel execution ${execution.metadata.name}? This cannot be undone.`
+  );
+  if (!confirmed) {
+    return;
+  }
   try {
     await request(`/executions/${execution.metadata.id}/actions/cancel`, {
       method: "POST",
       body: JSON.stringify({
         resourceVersion: execution.metadata.resourceVersion,
+        actor: "local-user",
+        requestSource: "web-ui",
       }),
     });
-    await loadAll();
+    await loadAll({force: true});
   } catch (error) {
     showError(error);
   }
@@ -1247,7 +1572,7 @@ async function decideApproval(id, decision) {
         requestSource: "web-ui",
       }),
     });
-    await loadAll();
+    await loadAll({force: true});
   } catch (error) {
     showError(error);
   }
@@ -1287,6 +1612,24 @@ function connectEvents() {
   source.onopen = () => setConnection("Live");
   source.onerror = () => setConnection("Polling");
   for (const eventName of [
+    "GoalCreated",
+    "ExecutionRunStarted",
+    "ExecutionRunWaiting",
+    "ExecutionRunCompleted",
+    "ExecutionRunFailed",
+    "ExecutionCancellationRequested",
+    "PlannerRunStarted",
+    "PlannerRunCompleted",
+    "PlannerQuestionsProduced",
+    "WorkspacePreparationStarted",
+    "WorkspacePreparationFailed",
+    "CodingRunStarted",
+    "VerificationCompleted",
+    "VerificationFailed",
+    "VerificationSkipped",
+    "ReviewerRunStarted",
+    "ApprovalRequested",
+    "UserInputProvided",
     "ExecutionPhaseChanged",
     "PlanPhaseChanged",
     "WorkItemPhaseChanged",
@@ -1297,6 +1640,9 @@ function connectEvents() {
     "AgentPhaseChanged",
   ]) {
     source.addEventListener(eventName, () => {
+      if (hasActiveFormControl()) {
+        return;
+      }
       void loadExecutionResources().then(render);
     });
   }
@@ -1314,11 +1660,74 @@ function selectedExecution() {
   );
 }
 
+function captureUserInputDraft() {
+  const controls = elements["user-input-list"]?.querySelectorAll(
+    "textarea[data-question-id]"
+  );
+  if (!controls) {
+    return;
+  }
+  for (const control of controls) {
+    state.userInputDraft[control.dataset.questionId] = control.value;
+  }
+}
+
+function plannerQuestions() {
+  const questionEvent = state.events
+    .slice()
+    .reverse()
+    .find(event => event.spec.type === "PlannerQuestionsProduced");
+  const questions = questionEvent?.spec?.payload?.questions || [];
+  return Array.isArray(questions) ? questions : [];
+}
+
 function executionsForSelectedProject() {
   return state.executions.filter(execution => {
     const projectRef = execution.spec.projectRef;
     return projectRef && projectRef.id === state.selectedProjectId;
   });
+}
+
+function canCancelExecution(execution) {
+  return [
+    "WaitingForUserInput",
+    "WaitingForPlanApproval",
+    "Executing",
+    "WaitingForFinalApproval",
+  ].includes(execution.status.phase);
+}
+
+function isTerminalExecution(execution) {
+  return ["Completed", "Failed", "Cancelled", "Archived"].includes(
+    execution.status.phase
+  );
+}
+
+function hasActiveFormControl() {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement)) {
+    return false;
+  }
+  return Boolean(
+    active.closest(
+      "#project-form, #execution-form, #user-input-form, #approval-list"
+    )
+  );
+}
+
+function startAutoRefresh() {
+  window.setInterval(() => {
+    const execution = selectedExecution();
+    if (
+      !execution ||
+      isTerminalExecution(execution) ||
+      state.loading ||
+      hasActiveFormControl()
+    ) {
+      return;
+    }
+    void loadAll();
+  }, 2500);
 }
 
 function bindListAction(containerId, action, handler) {
@@ -1384,6 +1793,41 @@ function phaseBadge(value) {
     `<span class="phase-badge" data-phase="${escapeHtml(value)}">` +
     `${escapeHtml(value)}</span>`
   );
+}
+
+function eventSummary(event) {
+  const payload = event.spec.payload || {};
+  const parts = [];
+  if (payload.fromPhase || payload.toPhase) {
+    parts.push(`${payload.fromPhase || "?"} -> ${payload.toPhase || "?"}`);
+  }
+  for (const key of [
+    "phase",
+    "reason",
+    "message",
+    "error",
+    "repository",
+    "workspaceId",
+    "planId",
+    "approvalId",
+    "workItemId",
+    "agent",
+    "reviewId",
+    "decision",
+    "actor",
+  ]) {
+    if (payload[key] !== undefined && payload[key] !== null && payload[key] !== "") {
+      parts.push(`${key}: ${compactValue(payload[key])}`);
+    }
+  }
+  return parts.join(" | ");
+}
+
+function compactValue(value) {
+  if (typeof value === "object") {
+    return JSON.stringify(value);
+  }
+  return String(value);
 }
 
 function empty(value) {

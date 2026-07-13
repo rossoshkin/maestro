@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+from copy import deepcopy
 from typing import Any
 from uuid import UUID
 
@@ -46,6 +48,7 @@ from maestro.domain.providers import (
     Provider,
     ProviderMessage,
     ProviderMessageRole,
+    ProviderOperationError,
     StructuredGenerationRequest,
 )
 from maestro.domain.resources import (
@@ -80,7 +83,39 @@ Produce a compact JSON object that conforms to the supplied schema.
 Do not modify files, execute commands, approve plans, or schedule agents.
 Create small independently verifiable work items.
 Ask blocking questions only when the goal cannot safely proceed without them.
+Use lower-case hyphen-separated IDs such as add-health, never underscores.
+Use the coding role for implementation work items.
+Use roleRef.version v1alpha1 for implementation work items.
+Only request known workspace capabilities: filesystem.read, filesystem.write,
+shell.execute.test, git.status, git.diff. Omit capabilities when unsure.
 """
+PLANNER_DEFAULT_WORK_ITEM_ROLE = "coding"
+PLANNER_DEFAULT_ROLE_VERSION = "v1alpha1"
+PLANNER_ROLE_VERSION_ALIASES = {
+    "v1": PLANNER_DEFAULT_ROLE_VERSION,
+    "v1alpha1": PLANNER_DEFAULT_ROLE_VERSION,
+}
+PLANNER_ALLOWED_WORK_ITEM_CAPABILITIES = frozenset(
+    {
+        "filesystem.read",
+        "filesystem.write",
+        "shell.execute.test",
+        "git.status",
+        "git.diff",
+    }
+)
+PLANNER_CAPABILITY_ALIASES = {
+    "filesystem-read": "filesystem.read",
+    "filesystem_read": "filesystem.read",
+    "filesystem-write": "filesystem.write",
+    "filesystem_write": "filesystem.write",
+    "shell-execute-test": "shell.execute.test",
+    "shell_execute_test": "shell.execute.test",
+    "git-status": "git.status",
+    "git_status": "git.status",
+    "git-diff": "git.diff",
+    "git_diff": "git.diff",
+}
 
 
 class PlannerQuestion(MaestroModel):
@@ -237,23 +272,38 @@ class PlannerRuntime:
                 media_type="text/markdown",
                 content=prompt.encode("utf-8"),
             )
-            response = await runtime.generate_structured(
-                StructuredGenerationRequest(
-                    model=agent.spec.model,
-                    messages=(
-                        ProviderMessage(
-                            role=ProviderMessageRole.SYSTEM,
-                            content=PLANNER_PROMPT_TEMPLATE,
+            try:
+                response = await runtime.generate_structured(
+                    StructuredGenerationRequest(
+                        model=agent.spec.model,
+                        messages=(
+                            ProviderMessage(
+                                role=ProviderMessageRole.SYSTEM,
+                                content=PLANNER_PROMPT_TEMPLATE,
+                            ),
+                            ProviderMessage(
+                                role=ProviderMessageRole.USER,
+                                content=prompt,
+                            ),
                         ),
-                        ProviderMessage(
-                            role=ProviderMessageRole.USER,
-                            content=prompt,
-                        ),
-                    ),
-                    responseSchema=PlannerOutput.model_json_schema(by_alias=True),
-                    timeoutSeconds=provider.spec.timeout_seconds,
+                        responseSchema=PlannerOutput.model_json_schema(by_alias=True),
+                        timeoutSeconds=provider.spec.timeout_seconds,
+                    )
                 )
-            )
+            except ProviderOperationError as error:
+                failed = await self._mark_invocation_failed(
+                    running,
+                    provider=provider,
+                    model=agent.spec.model,
+                    prompt_artifact=prompt_artifact,
+                    response_artifact=None,
+                    reason="PlannerProviderFailed",
+                    message=f"{error.failure.code}: {error.failure.message}",
+                )
+                raise PlannerProviderError(
+                    failed.metadata.id,
+                    failed.status.failure.message if failed.status.failure else "",
+                ) from error
             response_artifact = await self._create_artifact(
                 invocation=running,
                 execution=execution,
@@ -273,7 +323,11 @@ class PlannerRuntime:
                 source_refs=(_resource_ref(prompt_artifact),),
             )
             try:
-                planner_output = PlannerOutput.model_validate(response.output)
+                planner_output = _planner_output_from_provider_payload(
+                    response.output,
+                    execution=execution,
+                    project=project,
+                )
                 result = await self._handle_valid_output(
                     execution,
                     project,
@@ -401,7 +455,7 @@ class PlannerRuntime:
         version: int,
     ) -> RoleInvocation:
         invocation = RoleInvocation.new(
-            name=f"planner-{execution.metadata.id.hex[:12]}-v{version}",
+            name=await self._next_invocation_name(execution, version),
             namespace=execution.metadata.namespace,
             spec=RoleInvocationSpec(
                 executionRef=RoleInvocationExecutionReference(
@@ -424,6 +478,25 @@ class PlannerRuntime:
             ),
         )
         return await self._role_invocation_repository.create(invocation)
+
+    async def _next_invocation_name(
+        self,
+        execution: Execution,
+        version: int,
+    ) -> str:
+        base = f"planner-{execution.metadata.id.hex[:12]}-v{version}"
+        invocations = await self._role_invocation_repository.list_by_execution(
+            execution.metadata.id
+        )
+        attempts = tuple(
+            invocation
+            for invocation in invocations
+            if invocation.metadata.name == base
+            or invocation.metadata.name.startswith(f"{base}-a")
+        )
+        if not attempts:
+            return base
+        return f"{base}-a{len(attempts) + 1}"
 
     async def _mark_invocation_running(
         self,
@@ -485,7 +558,7 @@ class PlannerRuntime:
         provider: Provider,
         model: str,
         prompt_artifact: Artifact,
-        response_artifact: Artifact,
+        response_artifact: Artifact | None,
         reason: str,
         message: str,
     ) -> RoleInvocation:
@@ -497,7 +570,11 @@ class PlannerRuntime:
                 "provider_ref": _provider_ref(provider),
                 "model": model,
                 "prompt_artifact_ref": _resource_ref(prompt_artifact),
-                "response_artifact_ref": _resource_ref(response_artifact),
+                "response_artifact_ref": (
+                    _resource_ref(response_artifact)
+                    if response_artifact is not None
+                    else None
+                ),
                 "completed_at": utc_now(),
                 "failure": RoleInvocationFailure(reason=reason, message=message),
             }
@@ -608,6 +685,14 @@ class PlannerOutputError(ValueError):
         super().__init__(f"Invalid Planner output for {invocation_id}: {message}")
 
 
+class PlannerProviderError(ValueError):
+    """Raised when the Planner provider fails before returning structured output."""
+
+    def __init__(self, invocation_id: UUID, message: str) -> None:
+        self.invocation_id = invocation_id
+        super().__init__(f"Planner provider failed for {invocation_id}: {message}")
+
+
 def build_planner_input(
     execution: Execution,
     project: Project,
@@ -670,6 +755,237 @@ def _planner_prompt(
         )
         prompt["validationError"] = validation_error
     return json.dumps(prompt, indent=2, sort_keys=True)
+
+
+def _planner_output_from_provider_payload(
+    payload: Any,
+    *,
+    execution: Execution,
+    project: Project,
+) -> PlannerOutput:
+    normalized_payload = _normalize_planner_output_payload(
+        payload,
+        execution=execution,
+        project=project,
+    )
+    try:
+        return PlannerOutput.model_validate(normalized_payload)
+    except ValidationError:
+        repaired_payload = _normalize_planner_output_payload(
+            payload,
+            execution=execution,
+            project=project,
+        )
+        return PlannerOutput.model_validate(repaired_payload)
+
+
+def _normalize_planner_output_payload(
+    payload: Any,
+    *,
+    execution: Execution,
+    project: Project,
+) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+
+    normalized = deepcopy(payload)
+    if not isinstance(normalized, dict):
+        return payload
+
+    _normalize_planner_questions(normalized)
+    _normalize_planner_work_items(
+        normalized,
+        execution=execution,
+        project=project,
+    )
+    return normalized
+
+
+def _normalize_planner_questions(payload: dict[str, Any]) -> None:
+    questions = payload.get("questions")
+    if not isinstance(questions, list | tuple):
+        return
+
+    used: set[str] = set()
+    for index, question in enumerate(questions, start=1):
+        if not isinstance(question, dict):
+            continue
+        question["id"] = _dedupe_resource_name(
+            _coerce_resource_name(
+                question.get("id"),
+                fallback=f"question-{index}",
+            ),
+            used,
+        )
+
+
+def _normalize_planner_work_items(
+    payload: dict[str, Any],
+    *,
+    execution: Execution,
+    project: Project,
+) -> None:
+    work_items = payload.get("workItems")
+    if not isinstance(work_items, list | tuple):
+        return
+
+    used_ids: set[str] = set()
+    id_map: dict[str, str] = {}
+    repository_ids = tuple(repository.id for repository in project.spec.repositories)
+
+    for index, work_item in enumerate(work_items, start=1):
+        if not isinstance(work_item, dict):
+            continue
+        raw_id = work_item.get("id")
+        normalized_id = _dedupe_resource_name(
+            _coerce_resource_name(raw_id, fallback=f"work-item-{index}"),
+            used_ids,
+        )
+        work_item["id"] = normalized_id
+        if isinstance(raw_id, str):
+            id_map[raw_id] = normalized_id
+            id_map[_coerce_resource_name(raw_id, fallback=normalized_id)] = (
+                normalized_id
+            )
+
+    for work_item in work_items:
+        if not isinstance(work_item, dict):
+            continue
+        _normalize_planner_work_item_role(work_item, execution)
+        _normalize_planner_work_item_repository(work_item, repository_ids)
+        _normalize_planner_work_item_dependencies(work_item, id_map)
+        _normalize_planner_work_item_capabilities(work_item)
+
+
+def _normalize_planner_work_item_role(
+    work_item: dict[str, Any],
+    execution: Execution,
+) -> None:
+    role_ref = work_item.get("roleRef")
+    if not isinstance(role_ref, dict):
+        return
+
+    allowed_roles = tuple(execution.spec.requested_roles)
+    fallback_role = (
+        PLANNER_DEFAULT_WORK_ITEM_ROLE
+        if PLANNER_DEFAULT_WORK_ITEM_ROLE in allowed_roles
+        else _first_work_item_role(allowed_roles)
+    )
+    role_name = _coerce_resource_name(role_ref.get("name"), fallback=fallback_role)
+    if role_name not in allowed_roles:
+        role_name = fallback_role
+    role_ref["name"] = role_name
+    role_ref["version"] = _coerce_role_version(role_ref.get("version"))
+
+
+def _first_work_item_role(roles: tuple[ResourceName, ...]) -> ResourceName:
+    for role in roles:
+        if role not in {"planner", "reviewer"}:
+            return role
+    return roles[0] if roles else PLANNER_DEFAULT_WORK_ITEM_ROLE
+
+
+def _coerce_role_version(value: Any) -> str:
+    if not isinstance(value, str):
+        return PLANNER_DEFAULT_ROLE_VERSION
+    text = value.strip().lower()
+    return PLANNER_ROLE_VERSION_ALIASES.get(text, PLANNER_DEFAULT_ROLE_VERSION)
+
+
+def _normalize_planner_work_item_repository(
+    work_item: dict[str, Any],
+    repository_ids: tuple[ResourceName, ...],
+) -> None:
+    repository_ref = work_item.get("repositoryRef")
+    if repository_ref is None:
+        return
+    normalized = _coerce_resource_name(repository_ref, fallback="")
+    if repository_ids and normalized not in repository_ids:
+        normalized = repository_ids[0]
+    work_item["repositoryRef"] = normalized or None
+
+
+def _normalize_planner_work_item_dependencies(
+    work_item: dict[str, Any],
+    id_map: dict[str, str],
+) -> None:
+    depends_on = work_item.get("dependsOn")
+    if not isinstance(depends_on, list | tuple):
+        return
+    normalized_dependencies: list[str] = []
+    for index, dependency in enumerate(depends_on, start=1):
+        if not isinstance(dependency, str):
+            continue
+        normalized = id_map.get(dependency)
+        if normalized is None:
+            normalized = id_map.get(
+                _coerce_resource_name(
+                    dependency,
+                    fallback=f"dependency-{index}",
+                )
+            )
+        if normalized is None:
+            normalized = _coerce_resource_name(
+                dependency,
+                fallback=f"dependency-{index}",
+            )
+        if normalized not in normalized_dependencies:
+            normalized_dependencies.append(normalized)
+    work_item["dependsOn"] = tuple(normalized_dependencies)
+
+
+def _normalize_planner_work_item_capabilities(work_item: dict[str, Any]) -> None:
+    capabilities = work_item.get("requestedCapabilities")
+    if not isinstance(capabilities, list | tuple):
+        return
+    normalized: list[str] = []
+    for capability in capabilities:
+        if not isinstance(capability, str):
+            continue
+        candidate = _coerce_capability_name(capability)
+        if (
+            candidate in PLANNER_ALLOWED_WORK_ITEM_CAPABILITIES
+            and candidate not in normalized
+        ):
+            normalized.append(candidate)
+    work_item["requestedCapabilities"] = tuple(normalized)
+
+
+def _coerce_capability_name(value: str) -> str:
+    text = value.strip().lower()
+    if text in PLANNER_CAPABILITY_ALIASES:
+        return PLANNER_CAPABILITY_ALIASES[text]
+    dotted = text.replace("_", ".").replace("-", ".")
+    if dotted in PLANNER_ALLOWED_WORK_ITEM_CAPABILITIES:
+        return dotted
+    return text
+
+
+def _coerce_resource_name(value: Any, *, fallback: str) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+    else:
+        normalized = ""
+    normalized = normalized.replace("_", "-")
+    normalized = re.sub(r"[^a-z0-9-]+", "-", normalized)
+    normalized = re.sub(r"-+", "-", normalized).strip("-")
+    if not normalized:
+        normalized = fallback
+    normalized = normalized[:63].strip("-")
+    return normalized or fallback or "resource"
+
+
+def _dedupe_resource_name(name: str, used: set[str]) -> str:
+    if name not in used:
+        used.add(name)
+        return name
+    for suffix in range(2, 1000):
+        suffix_text = f"-{suffix}"
+        candidate = f"{name[: 63 - len(suffix_text)].rstrip('-')}{suffix_text}"
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+    raise ValueError("Unable to produce unique Planner resource name")
 
 
 def _plan_spec_from_output(
